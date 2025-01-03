@@ -277,34 +277,78 @@ void loop() {
         if (!scanMode) {
             // Переключаемся в режим сканирования
             Serial.println("Switching to scan mode...");
+            
+            // 1. Останавливаем все активные операции
             if (connected) {
-                bleServer->disconnect(0);  // Отключаем все соединения
+                bleServer->disconnect(0);
             }
-            bleServer->stopAdvertising();  // Останавливаем рекламу
+            bleServer->stopAdvertising();
+            delay(100);  // Даем время на остановку
+            
+            // 2. Очищаем сканер перед запуском
+            NimBLEScan* pScan = NimBLEDevice::getScan();
+            pScan->clearResults();
+            pScan->setActiveScan(true);
+            
             scanMode = true;
             
-            // Запускаем сканирование
-            NimBLEScan* pScan = NimBLEDevice::getScan();
-            pScan->setActiveScan(true);
-            pScan->start(0);  // Бесконечное сканирование
+            // 3. Запускаем сканирование
+            pScan->start(0);
         } else {
             Serial.println("\n=== Restoring HID Mode ===");
             
-            // 1. Останавливаем сканирование
+            // 1. Останавливаем сканирование и ждем остановки
             Serial.println("Stopping scan...");
             NimBLEDevice::getScan()->stop();
-            NimBLEDevice::getScan()->clearResults();
+            delay(1000);  // Важно! Ждем полной остановки сканирования
             
-            // 2. Останавливаем сервисы HID
-            Serial.println("Stopping HID services...");
-            bleServer->getAdvertising()->stop();
-            hid->stopServices();  // Используем метод HID устройства
+            // 2. Останавливаем остальные операции
+            Serial.println("Stopping other operations...");
+            if (bleServer) {
+                bleServer->getAdvertising()->stop();
+                if (connected) {
+                    bleServer->disconnect(0);
+                }
+            }
+            delay(100);
             
-            // 3. Перезапускаем сервисы HID
-            Serial.println("Restarting HID services...");
-            hid->startServices();  // Используем метод HID устройства
+            // 3. Освобождаем память
+            Serial.println("Cleaning up...");
+            if (hid) {
+                delete hid;
+                hid = nullptr;
+            }
+            bleServer = nullptr;
+            input = nullptr;
+            output = nullptr;
+            delay(100);
             
-            // 4. Запускаем рекламу
+            // 4. Сбрасываем стек
+            Serial.println("Reinitializing BLE stack...");
+            NimBLEDevice::deinit();
+            delay(500);
+            
+            // 5. Инициализируем заново
+            NimBLEDevice::init("M5 BLE KB");
+            NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+            
+            // 6. Пересоздаем сервер и HID
+            Serial.println("Recreating server and HID...");
+            bleServer = NimBLEDevice::createServer();
+            bleServer->setCallbacks(new ServerCallbacks());
+            
+            hid = new NimBLEHIDDevice(bleServer);
+            hid->setManufacturer("M5Stack");
+            hid->setPnp(0x02, 0x05AC, 0x820A, 0x0001);
+            hid->setHidInfo(0x00, 0x01);
+            
+            input = hid->getInputReport(1);
+            output = hid->getOutputReport(1);
+            
+            hid->setReportMap((uint8_t*)hidReportDescriptor, sizeof(hidReportDescriptor));
+            hid->startServices();
+            
+            // 7. Запуск рекламы
             Serial.println("Starting advertising...");
             bleServer->getAdvertising()->start();
             
