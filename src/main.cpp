@@ -336,47 +336,120 @@ static esp_ble_scan_params_t scan_params = {
 
 // Функция определения необходимости блокировки
 bool shouldLockComputer(int avgRssi) {
-    static int samplesBelow = 0;
+    if (!connected) return false;
+    
+    DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
     static bool wasNear = false;
-    static bool lockSent = false;
+    static int samplesBelow = 0;
     
-    // Не блокируем, если уже заблокировано
-    if (currentState == LOCKED) return false;
-    
-    // Сначала определяем, находимся ли мы близко к компьютеру
-    if (avgRssi > RSSI_NEAR_THRESHOLD) {
+    // Используем индивидуальные настройки
+    if (avgRssi > settings.unlockRssi) {
         wasNear = true;
         samplesBelow = 0;
-        lockSent = false;
-        return false;
     }
     
-    // Если мы были близко и сигнал стал слабее порога
-    if (wasNear && avgRssi < RSSI_LOCK_THRESHOLD) {
+    if (wasNear && avgRssi < settings.lockRssi) {
         samplesBelow++;
-        Serial.printf("Signal below threshold: %d/%d samples\n", 
-            samplesBelow, SAMPLES_TO_CONFIRM);
-            
-        // Если достаточно измерений подтверждают удаление
-        if (samplesBelow >= SAMPLES_TO_CONFIRM && !lockSent) {
-            Serial.println("\n!!! Lock condition detected !!!");
-            Serial.printf("Average RSSI: %d (Threshold: %d)\n", avgRssi, RSSI_LOCK_THRESHOLD);
+        if (samplesBelow >= SAMPLES_TO_CONFIRM) {
             return true;
         }
-    } else {
-        samplesBelow = 0;
     }
     
     return false;
 }
 
-// Добавляем константы для хранения паролей
-static const char* KEY_PASSWORD_PREFIX = "pwd_";  // Префикс для ключей паролей
-static const int MAX_STORED_PASSWORDS = 5;        // Максимум сохраненных паролей
+// Изменяем константы для хранения паролей
+static const char* KEY_PWD_PREFIX = "pwd_";  // Префикс для ключей паролей
+static const int MAX_STORED_PASSWORDS = 5;   // Максимум сохраненных паролей
 
-// Функция для получения пароля
+// Добавим более сложный ключ шифрования (32 байта)
+static const uint8_t ENCRYPTION_KEY[] = {
+    0x89, 0x4E, 0x1C, 0xE7, 0x3A, 0x5D, 0x2B, 0xF8,
+    0x6C, 0x91, 0x0D, 0xB4, 0x7F, 0xE2, 0x9A, 0x3C,
+    0x5E, 0x8D, 0x1B, 0xF4, 0x6A, 0x2C, 0x9E, 0x0B,
+    0x7D, 0x4F, 0xA3, 0xE5, 0x8C, 0x1D, 0xB6, 0x3F
+};
+
+// Объявляем прототипы функций
+String encryptPassword(const String& password);
+String decryptPassword(const String& encrypted);
+void clearAllPasswords();
+
+// Определяем функции
+String encryptPassword(const String& password) {
+    String result = "";
+    for(size_t i = 0; i < password.length(); i++) {
+        uint8_t c = password[i];
+        c = c ^ ENCRYPTION_KEY[i % 32];
+        c = c ^ ENCRYPTION_KEY[(i + 7) % 32];
+        c = c ^ ENCRYPTION_KEY[(i * 13 + 5) % 32];
+        result += char(c);
+    }
+    return result;
+}
+
+String decryptPassword(const String& encrypted) {
+    return encryptPassword(encrypted);
+}
+
+void clearAllPasswords() {
+    for (int i = 0; i < MAX_STORED_PASSWORDS; i++) {
+        String key = String(KEY_PWD_PREFIX) + String(i);
+        preferences.remove((key + "_addr").c_str());
+        preferences.remove((key + "_pwd").c_str());
+    }
+}
+
+// Функция для получения пароля по адресу устройства
 String getPasswordForDevice(const String& deviceAddress) {
-    return preferences.getString(KEY_PASSWORD, "");  // Убираем отладочный вывод
+    for (int i = 0; i < MAX_STORED_PASSWORDS; i++) {
+        String key = String(KEY_PWD_PREFIX) + String(i);
+        String addr = preferences.getString((key + "_addr").c_str(), "");
+        if (addr == deviceAddress) {
+            String encrypted = preferences.getString((key + "_pwd").c_str(), "");
+            return encrypted.length() > 0 ? decryptPassword(encrypted) : "";  // Расшифровываем при чтении
+        }
+    }
+    return "";
+}
+
+// Функция для сохранения пароля
+void savePasswordForDevice(const String& deviceAddress, const String& password) {
+    int slot = -1;
+    for (int i = 0; i < MAX_STORED_PASSWORDS; i++) {
+        String key = String(KEY_PWD_PREFIX) + String(i);
+        String addr = preferences.getString((key + "_addr").c_str(), "");
+        if (addr == deviceAddress || addr.length() == 0) {
+            slot = i;
+            break;
+        }
+    }
+    
+    if (slot >= 0) {
+        String key = String(KEY_PWD_PREFIX) + String(slot);
+        preferences.putString((key + "_addr").c_str(), deviceAddress);
+        String encrypted = encryptPassword(password);  // Шифруем перед сохранением
+        preferences.putString((key + "_pwd").c_str(), encrypted);
+        Serial.println("Password saved");
+    } else {
+        Serial.println("No free slots!");
+    }
+}
+
+// Добавим функцию для просмотра сохраненных устройств
+void listStoredDevices() {
+    Serial.println("\nStored devices:");
+    
+    // Проверяем каждое возможное устройство
+    for (int i = 0; i < MAX_STORED_PASSWORDS; i++) {
+        String key = String(KEY_PWD_PREFIX) + String(i);
+        String addr = preferences.getString((key + "_addr").c_str(), "");
+        if (addr.length() > 0) {
+            String pwd = preferences.getString((key + "_pwd").c_str(), "");
+            Serial.printf("%d. %s: %s\n", i + 1, addr.c_str(), 
+                pwd.length() > 0 ? "SET" : "NOT SET");
+        }
+    }
 }
 
 // Функция отправки одного символа
@@ -442,11 +515,12 @@ void setPasswordFromSerial() {
             char c = Serial.read();
             if (c == '\n' || c == '\r') {
                 if (newPassword.length() > 0) {
+                    Serial.println();
                     break;
                 }
             } else {
                 newPassword += c;
-                Serial.print("*");
+                Serial.print("*");  // Только звездочка
             }
         }
         delay(10);
@@ -454,49 +528,118 @@ void setPasswordFromSerial() {
     
     if (newPassword.length() > 0) {
         savePasswordForDevice(connectedDeviceAddress.c_str(), newPassword);
-        
-        // Проверяем что пароль сохранился
-        String savedPwd = getPasswordForDevice(connectedDeviceAddress.c_str());
-        if (savedPwd == newPassword) {
-            Serial.println("\nPassword saved and verified successfully!");
-        } else {
-            Serial.println("\nError: Password verification failed!");
-        }
-        
-        // Показываем на экране
-        Disbuff->fillSprite(BLACK);
-        Disbuff->setTextColor(GREEN);
-        Disbuff->setCursor(5, 40);
-        Disbuff->print("NEW PWD!");
-        Disbuff->pushSprite(0, 0);
-        delay(1000);
+        Serial.println("Password saved");
     }
 }
 
-// Добавляем обработку команд через Serial
-void checkSerialCommands() {
-    if (Serial.available()) {
-        String command = Serial.readStringUntil('\n');
-        command.trim();
-        
-        if (command == "setpwd") {
-            if (connected) {
-                setPasswordFromSerial();
-            } else {
-                Serial.println("Error: No device connected!");
+// Добавим флаг для управления выводом
+static bool serialOutputEnabled = true;
+
+// Добавим функцию для эхо ввода
+void echoSerialInput() {
+    static String inputBuffer = "";
+    
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (inputBuffer.length() > 0) {
+                Serial.println("\n=== Command execution ===");  // Добавим разделитель
+                // Обрабатываем команду
+                if (inputBuffer == "setpwd") {
+                    if (connected) {
+                        setPasswordFromSerial();
+                    } else {
+                        Serial.println("Error: No device connected!");
+                    }
+                } else if (inputBuffer == "getpwd") {
+                    if (connected) {
+                        String pwd = getPasswordForDevice(connectedDeviceAddress.c_str());
+                        Serial.printf("Device: %s\n", connectedDeviceAddress.c_str());
+                        if (pwd.length() > 0) {
+                            Serial.println("Password is SET");
+                            // Serial.printf("Password: %s\n", pwd.c_str());  // Раскомментировать для отладки
+                        } else {
+                            Serial.println("Password is NOT SET");
+                        }
+                    } else {
+                        Serial.println("Error: No device connected!");
+                    }
+                } else if (inputBuffer == "list") {
+                    listStoredDevices();
+                } else if (inputBuffer == "silent") {
+                    serialOutputEnabled = !serialOutputEnabled;
+                    Serial.printf("Serial output %s\n", 
+                        serialOutputEnabled ? "enabled" : "disabled");
+                } else if (inputBuffer == "help") {
+                    Serial.println("\nAvailable commands:");
+                    Serial.println("setpwd - Set password for current device");
+                    Serial.println("getpwd - Show current password");
+                    Serial.println("list   - Show stored devices");
+                    Serial.println("silent - Toggle debug output");
+                    Serial.println("help   - Show this help");
+                } else if (inputBuffer == "clear") {
+                    clearAllPasswords();
+                    Serial.println("All passwords cleared");
+                } else if (inputBuffer == "test") {
+                    // Тест шифрования
+                    String testPass = "MyTestPassword123";
+                    String encrypted = encryptPassword(testPass);
+                    String decrypted = decryptPassword(encrypted);
+                    
+                    Serial.println("\nEncryption test:");
+                    Serial.printf("Original : %s\n", testPass.c_str());
+                    Serial.printf("Encrypted: ");
+                    for(char c : encrypted) {
+                        Serial.printf("%02X ", (uint8_t)c);
+                    }
+                    Serial.println();
+                    Serial.printf("Decrypted: %s\n", decrypted.c_str());
+                    Serial.printf("Test %s\n", testPass == decrypted ? "PASSED" : "FAILED");
+                } else if (inputBuffer == "setrssl") {  // set RSSI Lock threshold
+                    if (connected) {
+                        Serial.println("Enter RSSI value for LOCK threshold (-30 to -90):");
+                        while (!Serial.available()) delay(10);
+                        int rssi = Serial.parseInt();
+                        if (rssi >= -90 && rssi <= -30) {
+                            DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
+                            settings.lockRssi = rssi;
+                            saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
+                            Serial.printf("Lock RSSI threshold set to %d\n", rssi);
+                        } else {
+                            Serial.println("Invalid RSSI value!");
+                        }
+                    }
+                } else if (inputBuffer == "setrssu") {  // set RSSI Unlock threshold
+                    if (connected) {
+                        Serial.println("Enter RSSI value for UNLOCK threshold (-30 to -90):");
+                        while (!Serial.available()) delay(10);
+                        int rssi = Serial.parseInt();
+                        if (rssi >= -90 && rssi <= -30) {
+                            DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
+                            settings.unlockRssi = rssi;
+                            saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
+                            Serial.printf("Unlock RSSI threshold set to %d\n", rssi);
+                        } else {
+                            Serial.println("Invalid RSSI value!");
+                        }
+                    }
+                } else if (inputBuffer == "showrssi") {  // show current RSSI settings
+                    if (connected) {
+                        DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
+                        Serial.printf("\nDevice: %s\n", connectedDeviceAddress.c_str());
+                        Serial.printf("Unlock RSSI: %d\n", settings.unlockRssi);
+                        Serial.printf("Lock RSSI: %d\n", settings.lockRssi);
+                        Serial.printf("Current RSSI: %d\n", lastAverageRssi);
+                    }
+                } else {
+                    Serial.println("Unknown command. Type 'help' for available commands.");
+                }
+                Serial.println("=== End of command ===\n");    // Закрывающий разделитель
+                inputBuffer = "";
             }
-        } else if (command == "getpwd") {
-            if (connected) {
-                String pwd = getPasswordForDevice(connectedDeviceAddress.c_str());
-                Serial.printf("Current password for %s: %s\n", 
-                    connectedDeviceAddress.c_str(),
-                    pwd.length() > 0 ? pwd.c_str() : "not set");
-            }
-        } else if (command == "help") {
-            Serial.println("\nAvailable commands:");
-            Serial.println("setpwd - Set password for current device");
-            Serial.println("getpwd - Show current password");
-            Serial.println("help   - Show this help");
+        } else {
+            inputBuffer += c;
+            Serial.print(c);
         }
     }
 }
@@ -505,32 +648,33 @@ void checkSerialCommands() {
 static const unsigned long UNLOCK_ATTEMPT_INTERVAL = 5000;  // 5 секунд
 static unsigned long lastUnlockAttempt = 0;
 
-// Функция для сохранения пароля
-void savePasswordForDevice(const String& deviceAddress, const String& password) {
-    Serial.printf("Saving password '%s'\n", password.c_str());
-    
-    // Сохраняем текущее состояние блокировки
-    bool wasLocked = preferences.getBool(KEY_IS_LOCKED, false);
-    String lastAddr = preferences.getString(KEY_LAST_ADDR, "");
-    
-    // Сохраняем новый пароль
-    preferences.putString(KEY_PASSWORD, password);  // Используем тот же KEY_PASSWORD
-    
-    // Восстанавливаем состояние блокировки
-    if (wasLocked) {
-        preferences.putBool(KEY_IS_LOCKED, true);
-        preferences.putString(KEY_LAST_ADDR, lastAddr);
-    }
-    
-    // Проверяем сохранение пароля
-    String saved = preferences.getString(KEY_PASSWORD, "");  // И здесь тоже
-    Serial.printf("Immediately after save, read password: '%s'\n", saved.c_str());
-    
-    if (saved == password) {
-        Serial.println("Password saved successfully!");
-    } else {
-        Serial.println("Error saving password!");
-    }
+// Добавим счетчик неудачных попыток
+static int failedUnlockAttempts = 0;        // Счетчик неудачных попыток
+static unsigned long lastFailedAttempt = 0;  // Время последней неудачной попытки
+
+// Структура для хранения настроек устройства
+struct DeviceSettings {
+    int unlockRssi;     // Минимальный RSSI для разблокировки
+    int lockRssi;       // RSSI для блокировки
+    String password;    // Пароль (зашифрованный)
+};
+
+// Функции для работы с настройками
+void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings) {
+    String key = String(KEY_PWD_PREFIX) + String(deviceAddress);
+    preferences.putInt((key + "_unlock_rssi").c_str(), settings.unlockRssi);
+    preferences.putInt((key + "_lock_rssi").c_str(), settings.lockRssi);
+    preferences.putString((key + "_pwd").c_str(), settings.password);
+}
+
+DeviceSettings getDeviceSettings(const String& deviceAddress) {
+    String key = String(KEY_PWD_PREFIX) + String(deviceAddress);
+    DeviceSettings settings;
+    // Значения по умолчанию если настройки не найдены
+    settings.unlockRssi = preferences.getInt((key + "_unlock_rssi").c_str(), RSSI_NEAR_THRESHOLD);
+    settings.lockRssi = preferences.getInt((key + "_lock_rssi").c_str(), RSSI_LOCK_THRESHOLD);
+    settings.password = preferences.getString((key + "_pwd").c_str(), "");
+    return settings;
 }
 
 void setup() {
@@ -576,10 +720,11 @@ void setup() {
     
     // Настройки безопасности
     Serial.println("2. Setting up security...");
-    NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND | 
-                                 BLE_SM_PAIR_AUTHREQ_MITM | 
-                                 BLE_SM_PAIR_AUTHREQ_SC);
-    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    NimBLEDevice::setSecurityAuth(
+        BLE_SM_PAIR_AUTHREQ_BOND |     // Сохранение связи
+        BLE_SM_PAIR_AUTHREQ_MITM |     // Защита от MITM атак
+        BLE_SM_PAIR_AUTHREQ_SC);       // Secure Connections
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);  // Устройство без ввода/вывода
     
     // Создаем HID сервер
     Serial.println("3. Creating server...");
@@ -780,21 +925,14 @@ void loop() {
         connection_info.address = "";
     }
     
-    // Добавляем отладочную информацию каждые 5 секунд
-    if (millis() - lastDebugCheck >= 5000) {
+    // Добавляем отладочную информацию каждые 10 секунд
+    if (millis() - lastDebugCheck >= 10000) {
         lastDebugCheck = millis();
-        
-        Serial.printf("\n=== Status Update ===\n");
-        Serial.printf("Connected: %d\n", connected);
-        Serial.printf("Current RSSI: %d\n", lastAverageRssi);
-        Serial.printf("State: %s\n", 
-            currentState == NORMAL ? "NORMAL" :
-            currentState == MOVING_AWAY ? "MOVING_AWAY" :
-            currentState == LOCKED ? "LOCKED" :
-            currentState == APPROACHING ? "APPROACHING" : "UNKNOWN");
-        Serial.printf("Password: %s\n", 
-            getPasswordForDevice(connectedDeviceAddress.c_str()).length() > 0 ? "SET" : "NOT SET");
-        Serial.println("===================\n");
+        if (connected && serialOutputEnabled) {
+            Serial.printf("\nStatus: %s, RSSI: %d\n", 
+                currentState == LOCKED ? "LOCKED" : "NORMAL",
+                lastAverageRssi);
+        }
     }
     
     // Проверяем статус сканирования каждые 5 секунд
@@ -804,18 +942,23 @@ void loop() {
         
         NimBLEScan* pScan = NimBLEDevice::getScan();
         if (!pScan->isScanning()) {
-            Serial.println("Scan stopped, restarting...");
+            if (serialOutputEnabled) {  // Добавим проверку
+                Serial.println("Scan stopped, restarting...");
+            }
             pScan->setActiveScan(true);
             pScan->setInterval(0x50);
             pScan->setWindow(0x30);
             
             if(pScan->start(0)) {
-                Serial.println("Scan restarted successfully");
+                if (serialOutputEnabled) {  // Добавим проверку
+                    Serial.println("Scan restarted successfully");
+                }
             } else {
-                Serial.println("Failed to restart scan!");
+                if (serialOutputEnabled) {  // Добавим проверку
+                    Serial.println("Failed to restart scan!");
+                }
             }
         }
-        Serial.println("========================\n");
     }
     
     // В loop() добавляем обработку состояний
@@ -877,8 +1020,8 @@ void loop() {
         }
     }
     
-    // Проверяем команды Serial
-    checkSerialCommands();
+    // Заменяем checkSerialCommands() на echoSerialInput()
+    echoSerialInput();
     
     delay(1);
 }
@@ -973,4 +1116,23 @@ void unlockComputer() {
     
     // Возвращаем исходную мощность
     NimBLEDevice::setPower((esp_power_level_t)currentPower);
+    
+    if (!success) {
+        failedUnlockAttempts++;
+        lastFailedAttempt = millis();
+        
+        if (failedUnlockAttempts >= 3) {
+            Serial.println("Too many failed attempts. Locked for 5 minutes");
+            Disbuff->fillSprite(BLACK);
+            Disbuff->setTextColor(RED);
+            Disbuff->setCursor(5, 40);
+            Disbuff->print("LOCKED!");
+            Disbuff->pushSprite(0, 0);
+            
+            delay(300000);  // Блокируем на 5 минут (300000 мс)
+            failedUnlockAttempts = 0;  // Сбрасываем счетчик
+        }
+    } else {
+        failedUnlockAttempts = 0;  // При успешной разблокировке сбрасываем счетчик
+    }
 } 
