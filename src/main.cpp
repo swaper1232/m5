@@ -4,6 +4,31 @@
 #include "esp_task_wdt.h"
 #include "esp_gap_ble_api.h"
 #include "NimBLEClient.h"
+#include <Preferences.h>
+
+// В начало файла после включения библиотек
+void lockComputer();
+void unlockComputer();
+String getPasswordForDevice(const String& deviceAddress);
+void savePasswordForDevice(const String& deviceAddress, const String& password);
+void setPasswordFromSerial();
+void checkSerialCommands();
+
+// Создаем объект для работы с NVS
+static Preferences preferences;
+static const char* PREF_NAMESPACE = "ble_lock";
+static const char* KEY_IS_LOCKED = "is_locked";
+static const char* KEY_LAST_ADDR = "last_addr";
+static const char* KEY_PASSWORD = "password";  // Добавляем константу для пароля
+
+// Добавляем прототип функции
+void lockComputer();
+
+struct {
+    bool connected = false;
+    uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    std::string address = "";
+} connection_info;
 
 static NimBLEAdvertisementData advData;
 static NimBLEServer* bleServer;
@@ -18,6 +43,40 @@ static int lastAverageRssi = 0;
 
 // Добавим переменную для режима работы
 static bool scanMode = false;
+
+// Добавим переменную для хранения адреса подключенного устройства
+static std::string connectedDeviceAddress = "";
+
+// Константы для определения движения
+static const int MOVEMENT_SAMPLES = 10;     // Сколько измерений для определения движения
+static const int MOVEMENT_THRESHOLD = 5;    // Порог изменения RSSI для движения (dBm)
+static const int MOVEMENT_TIME = 3000;      // Время движения для блокировки (3 секунды)
+static const int SCAN_INTERVAL_LOCKED = 3000; // Интервал сканирования в заблокированном режиме
+
+// Константы для определения потери сигнала
+static const int SIGNAL_LOSS_THRESHOLD = -75;  // dBm, критический уровень сигнала
+static const int SIGNAL_LOSS_TIME = 5000;      // 5 секунд слабого сигнала для блокировки
+static unsigned long weakSignalStartTime = 0;   // Время начала слабого сигнала
+
+// Пороги для определения расстояния
+static const int RSSI_NEAR_THRESHOLD = -50;    // Когда мы близко к компьютеру
+static const int RSSI_LOCK_THRESHOLD = -65;    // Порог для блокировки
+static const int SAMPLES_TO_CONFIRM = 5;       // Увеличиваем до 5 измерений
+
+// Пороги для предупреждений
+static const int SIGNAL_WARNING_THRESHOLD = -65;  // Порог для предупреждения
+static const int SIGNAL_CRITICAL_THRESHOLD = -75; // Критический порог
+
+// Состояния устройства
+enum DeviceState {
+    NORMAL,         // Обычный режим
+    MOVING_AWAY,    // Движение от компьютера
+    LOCKED,         // Компьютер заблокирован
+    APPROACHING     // Приближение к компьютеру
+};
+
+static DeviceState currentState = NORMAL;
+static unsigned long movementStartTime = 0;
 
 // Стандартный дескриптор HID клавиатуры
 static const uint8_t hidReportDescriptor[] = {
@@ -48,66 +107,195 @@ static const uint8_t hidReportDescriptor[] = {
 };
 
 // Константы для измерения RSSI
-static const int RSSI_SAMPLES = 5;        // Количество измерений для усреднения
-static const int RSSI_INTERVAL = 1000;    // Интервал между измерениями (мс)
-static const int RSSI_THRESHOLD = 5;      // Порог изменения для определения движения
-
-// Переменные для хранения измерений RSSI
-static int rssiValues[RSSI_SAMPLES];
+static const int RSSI_SAMPLES = 5;
+static int rssiValues[RSSI_SAMPLES] = {0};  // Инициализируем нулями
 static int rssiIndex = 0;
-static unsigned long lastRssiCheck = 0;
+static int validSamples = 0;  // Счетчик валидных измерений
 
-// Функция для получения среднего RSSI
+// Улучшенная функция для получения среднего RSSI
 int getAverageRssi() {
+    if (validSamples == 0) return 0;
+    
     int sum = 0;
+    int count = 0;
+    
+    // Считаем среднее только по валидным значениям
     for (int i = 0; i < RSSI_SAMPLES; i++) {
-        sum += rssiValues[i];
+        if (rssiValues[i] != 0) {  // Пропускаем начальные нули
+            sum += rssiValues[i];
+            count++;
+        }
     }
-    return sum / RSSI_SAMPLES;
+    
+    return count > 0 ? sum / count : 0;
+}
+
+// При добавлении нового значения
+void addRssiValue(int rssi) {
+    if (rssi < -100 || rssi > 0) return;  // Отбрасываем невалидные значения
+    
+    rssiValues[rssiIndex] = rssi;
+    rssiIndex = (rssiIndex + 1) % RSSI_SAMPLES;
+    if (validSamples < RSSI_SAMPLES) validSamples++;
 }
 
 // Добавим функцию для обновления экрана
 void updateDisplay() {
-    Disbuff->fillSprite(BLACK);  // Очищаем экран
-    
-    // Статус BLE
+    Disbuff->fillSprite(BLACK);
     Disbuff->setTextSize(2);
-    Disbuff->setTextColor(connected ? GREEN : RED);
-    Disbuff->setCursor(10, 10);
-    Disbuff->printf("BLE:");
-    Disbuff->setCursor(10, 35);
-    Disbuff->printf("%s", connected ? "Connected" : "Waiting");
     
-    // RSSI и движение (только если подключены)
+    // Статус BLE (уменьшенный)
+    Disbuff->setTextColor(connected ? GREEN : RED);
+    Disbuff->setCursor(5, 5);
+    Disbuff->printf("BLE:%s", connected ? "OK" : "NO");
+    
     if (connected) {
+        // RSSI информация
         Disbuff->setTextColor(WHITE);
-        Disbuff->setCursor(10, 70);
-        Disbuff->printf("RSSI: %d", lastAverageRssi);
+        Disbuff->setCursor(5, 25);
+        Disbuff->printf("RS:%d", lastAverageRssi);
         
-        Disbuff->setCursor(10, 95);
-        Disbuff->printf("Move: %s", lastMovement.c_str());
+        Disbuff->setCursor(5, 45);
+        Disbuff->printf("AV:%d", getAverageRssi());
+        
+        // Движение и состояние
+        Disbuff->setCursor(5, 65);
+        Disbuff->printf("ST:");
+        switch (currentState) {
+            case NORMAL: 
+                Disbuff->setTextColor(GREEN);
+                Disbuff->print("NORM"); 
+                break;
+            case MOVING_AWAY: 
+                Disbuff->setTextColor(YELLOW);
+                Disbuff->printf("AWAY:%d", 
+                    (MOVEMENT_TIME - (millis() - movementStartTime)) / 1000); // Секунды до блокировки
+                break;
+            case LOCKED: 
+                Disbuff->setTextColor(RED);
+                Disbuff->print("LOCK"); 
+                break;
+            case APPROACHING: 
+                Disbuff->setTextColor(BLUE);
+                Disbuff->print("APPR"); 
+                break;
+        }
+        
+        // Счетчик движения
+        static int lastMovementCount = 0;
+        if (currentState == MOVING_AWAY) {
+            Disbuff->setCursor(5, 85);
+            Disbuff->setTextColor(YELLOW);
+            Disbuff->printf("CNT:%d/%d", lastMovementCount, MOVEMENT_SAMPLES);
+        }
+        
+        // Разница RSSI
+        Disbuff->setCursor(5, 105);
+        Disbuff->setTextColor(WHITE);
+        static int lastRssiDiff = 0;
+        if (currentState == MOVING_AWAY || currentState == NORMAL) {
+            lastRssiDiff = getAverageRssi() - lastAverageRssi;
+            if (lastRssiDiff < 0) {
+                Disbuff->setTextColor(RED);    // Красный для удаления
+                Disbuff->printf("<<:%d", abs(lastRssiDiff));  // Стрелки влево
+            } else if (lastRssiDiff > 0) {
+                Disbuff->setTextColor(GREEN);  // Зеленый для приближения
+                Disbuff->printf(">>:%d", lastRssiDiff);       // Стрелки вправо
+            } else {
+                Disbuff->setTextColor(YELLOW); // Желтый для отсутствия движения
+                Disbuff->printf("==:%d", lastRssiDiff);       // Равно для стабильности
+            }
+        }
+        
+        // Индикатор уровня сигнала
+        Disbuff->setCursor(5, 125);
+        if (lastAverageRssi > -50) {
+            Disbuff->setTextColor(GREEN);
+            Disbuff->print("SIG:HIGH");
+        } else if (lastAverageRssi > SIGNAL_LOSS_THRESHOLD) {
+            Disbuff->setTextColor(YELLOW);
+            Disbuff->print("SIG:MID");
+        } else {
+            Disbuff->setTextColor(RED);
+            if (weakSignalStartTime > 0) {
+                int timeLeft = (SIGNAL_LOSS_TIME - (millis() - weakSignalStartTime)) / 1000;
+                Disbuff->printf("SIG:%ds", timeLeft);
+            } else {
+                Disbuff->print("SIG:LOW");
+            }
+        }
+        
+        // Показываем наличие пароля
+        Disbuff->setCursor(5, 145);
+        if (getPasswordForDevice(connectedDeviceAddress.c_str()).length() > 0) {
+            Disbuff->setTextColor(GREEN);
+            Disbuff->print("PWD:OK");
+        } else {
+            Disbuff->setTextColor(RED);
+            Disbuff->print("PWD:NO");
+        }
     }
     
-    Disbuff->pushSprite(0, 0);  // Выводим на экран
+    Disbuff->pushSprite(0, 0);
 }
 
-// Изменим колбэки
-class ServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* pServer) {
-        Serial.println("=== onConnect called ===");
-        Serial.printf("Connected count: %d\n", pServer->getConnectedCount());
-        Serial.printf("MTU Size: %d\n", pServer->getPeerMTU(0));
-        Serial.printf("Peer Address: %s\n", pServer->getPeerInfo(0).getAddress().toString().c_str());
-        
-        connected = true;
-        updateDisplay();
+// Сначала объявляем класс для колбэков сканирования
+class MyScanCallbacks: public NimBLEScanCallbacks {
+    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+        // Проверяем адрес устройства
+        if (advertisedDevice->getAddress().toString() == connectedDeviceAddress) {
+            int rssi = advertisedDevice->getRSSI();
+            lastAverageRssi = rssi;
+            updateDisplay();
+            addRssiValue(rssi);
+        }
     }
 
-    void onDisconnect(NimBLEServer* pServer, int reason) {
+    void onScanEnd(NimBLEScanResults results) {
+        // Можно полностью убрать этот метод, если он не нужен
+    }
+};
+
+// Затем объявляем глобальные переменные
+static NimBLEScan* pScan = nullptr;
+static MyScanCallbacks* scanCallbacks = nullptr;
+
+// Затем класс для колбэков сервера
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
+        Serial.printf("\n!!! onConnect CALLED for device: %s !!!\n", 
+            NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+            
+        // Сохраняем всю информацию о подключении
+        connection_info.connected = true;
+        connection_info.conn_handle = desc->conn_handle;
+        connection_info.address = NimBLEAddress(desc->peer_ota_addr).toString();
+        
+        Serial.printf("Connection handle: %d\n", connection_info.conn_handle);
+        Serial.printf("Device address: %s\n", connection_info.address.c_str());
+        
+        connected = true;
+        connectedDeviceAddress = connection_info.address;
+        updateDisplay();
+        
+        // После подключения запускаем сканирование
+        delay(1000);
+        Serial.println("\n=== Starting scan after connection ===");
+        pScan = NimBLEDevice::getScan();
+        pScan->setActiveScan(true);
+        pScan->setInterval(100);
+        pScan->setWindow(50);
+        pScan->setScanCallbacks(scanCallbacks, true);
+        bool started = pScan->start(0);
+        Serial.printf("Scan started: %d\n", started);
+        scanMode = true;
+    }
+
+    void onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
+        Serial.println("\n!!! onDisconnect CALLED !!!\n");
         Serial.println("=== onDisconnect called ===");
         Serial.printf("Connected count: %d\n", pServer->getConnectedCount());
         Serial.printf("Connected flag: %d\n", connected);
-        Serial.printf("Disconnect reason: 0x%02x\n", reason);
         
         connected = false;
         updateDisplay();
@@ -137,6 +325,214 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
 };
 
+static esp_ble_scan_params_t scan_params = {
+    .scan_type = BLE_SCAN_TYPE_ACTIVE,
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+    .scan_interval = 0x50,
+    .scan_window = 0x30,
+    .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE
+};
+
+// Функция определения необходимости блокировки
+bool shouldLockComputer(int avgRssi) {
+    static int samplesBelow = 0;
+    static bool wasNear = false;
+    static bool lockSent = false;
+    
+    // Не блокируем, если уже заблокировано
+    if (currentState == LOCKED) return false;
+    
+    // Сначала определяем, находимся ли мы близко к компьютеру
+    if (avgRssi > RSSI_NEAR_THRESHOLD) {
+        wasNear = true;
+        samplesBelow = 0;
+        lockSent = false;
+        return false;
+    }
+    
+    // Если мы были близко и сигнал стал слабее порога
+    if (wasNear && avgRssi < RSSI_LOCK_THRESHOLD) {
+        samplesBelow++;
+        Serial.printf("Signal below threshold: %d/%d samples\n", 
+            samplesBelow, SAMPLES_TO_CONFIRM);
+            
+        // Если достаточно измерений подтверждают удаление
+        if (samplesBelow >= SAMPLES_TO_CONFIRM && !lockSent) {
+            Serial.println("\n!!! Lock condition detected !!!");
+            Serial.printf("Average RSSI: %d (Threshold: %d)\n", avgRssi, RSSI_LOCK_THRESHOLD);
+            return true;
+        }
+    } else {
+        samplesBelow = 0;
+    }
+    
+    return false;
+}
+
+// Добавляем константы для хранения паролей
+static const char* KEY_PASSWORD_PREFIX = "pwd_";  // Префикс для ключей паролей
+static const int MAX_STORED_PASSWORDS = 5;        // Максимум сохраненных паролей
+
+// Функция для получения пароля
+String getPasswordForDevice(const String& deviceAddress) {
+    return preferences.getString(KEY_PASSWORD, "");  // Убираем отладочный вывод
+}
+
+// Функция отправки одного символа
+void sendKey(char key) {
+    uint8_t keyCode = 0;
+    uint8_t modifiers = 0;  // Используем отдельную переменную для модификаторов
+    
+    // Преобразование ASCII в HID код
+    if (key >= 'a' && key <= 'z') {
+        keyCode = 4 + (key - 'a');
+    } else if (key >= 'A' && key <= 'Z') {
+        keyCode = 4 + (key - 'A');
+        modifiers = 0x02;
+    } else if (key >= '1' && key <= '9') {
+        keyCode = 30 + (key - '1');
+    } else if (key == '0') {
+        keyCode = 39;
+    }
+    
+    if (keyCode > 0) {
+        uint8_t msg[8] = {modifiers, 0, keyCode, 0, 0, 0, 0, 0};  // Используем modifiers напрямую
+        input->setValue(msg, sizeof(msg));
+        input->notify();
+        delay(50);
+        
+        // Отпускаем клавишу
+        uint8_t release[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        input->setValue(release, sizeof(release));
+        input->notify();
+        delay(50);
+    }
+}
+
+// Функция ввода пароля
+void typePassword(const String& password) {
+    for (char c : password) {
+        sendKey(c);
+    }
+    // Отправляем Enter
+    uint8_t enter[8] = {0, 0, 0x28, 0, 0, 0, 0, 0};
+    input->setValue(enter, sizeof(enter));
+    input->notify();
+    delay(50);
+    
+    // Отпускаем Enter
+    uint8_t release[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    input->setValue(release, sizeof(release));
+    input->notify();
+}
+
+// Добавим константы для пароля по умолчанию
+static const char* DEFAULT_PASSWORD = "12345";  // Пример пароля
+
+// Добавляем функцию для ввода пароля через Serial
+void setPasswordFromSerial() {
+    Serial.println("\n=== Password Setup ===");
+    Serial.printf("Current device: %s\n", connectedDeviceAddress.c_str());
+    Serial.println("Enter new password (end with newline):");
+    
+    String newPassword = "";
+    while (true) {
+        if (Serial.available()) {
+            char c = Serial.read();
+            if (c == '\n' || c == '\r') {
+                if (newPassword.length() > 0) {
+                    break;
+                }
+            } else {
+                newPassword += c;
+                Serial.print("*");
+            }
+        }
+        delay(10);
+    }
+    
+    if (newPassword.length() > 0) {
+        savePasswordForDevice(connectedDeviceAddress.c_str(), newPassword);
+        
+        // Проверяем что пароль сохранился
+        String savedPwd = getPasswordForDevice(connectedDeviceAddress.c_str());
+        if (savedPwd == newPassword) {
+            Serial.println("\nPassword saved and verified successfully!");
+        } else {
+            Serial.println("\nError: Password verification failed!");
+        }
+        
+        // Показываем на экране
+        Disbuff->fillSprite(BLACK);
+        Disbuff->setTextColor(GREEN);
+        Disbuff->setCursor(5, 40);
+        Disbuff->print("NEW PWD!");
+        Disbuff->pushSprite(0, 0);
+        delay(1000);
+    }
+}
+
+// Добавляем обработку команд через Serial
+void checkSerialCommands() {
+    if (Serial.available()) {
+        String command = Serial.readStringUntil('\n');
+        command.trim();
+        
+        if (command == "setpwd") {
+            if (connected) {
+                setPasswordFromSerial();
+            } else {
+                Serial.println("Error: No device connected!");
+            }
+        } else if (command == "getpwd") {
+            if (connected) {
+                String pwd = getPasswordForDevice(connectedDeviceAddress.c_str());
+                Serial.printf("Current password for %s: %s\n", 
+                    connectedDeviceAddress.c_str(),
+                    pwd.length() > 0 ? pwd.c_str() : "not set");
+            }
+        } else if (command == "help") {
+            Serial.println("\nAvailable commands:");
+            Serial.println("setpwd - Set password for current device");
+            Serial.println("getpwd - Show current password");
+            Serial.println("help   - Show this help");
+        }
+    }
+}
+
+// Добавим константу для минимального интервала между попытками разблокировки
+static const unsigned long UNLOCK_ATTEMPT_INTERVAL = 5000;  // 5 секунд
+static unsigned long lastUnlockAttempt = 0;
+
+// Функция для сохранения пароля
+void savePasswordForDevice(const String& deviceAddress, const String& password) {
+    Serial.printf("Saving password '%s'\n", password.c_str());
+    
+    // Сохраняем текущее состояние блокировки
+    bool wasLocked = preferences.getBool(KEY_IS_LOCKED, false);
+    String lastAddr = preferences.getString(KEY_LAST_ADDR, "");
+    
+    // Сохраняем новый пароль
+    preferences.putString(KEY_PASSWORD, password);  // Используем тот же KEY_PASSWORD
+    
+    // Восстанавливаем состояние блокировки
+    if (wasLocked) {
+        preferences.putBool(KEY_IS_LOCKED, true);
+        preferences.putString(KEY_LAST_ADDR, lastAddr);
+    }
+    
+    // Проверяем сохранение пароля
+    String saved = preferences.getString(KEY_PASSWORD, "");  // И здесь тоже
+    Serial.printf("Immediately after save, read password: '%s'\n", saved.c_str());
+    
+    if (saved == password) {
+        Serial.println("Password saved successfully!");
+    } else {
+        Serial.println("Error saving password!");
+    }
+}
+
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
@@ -157,7 +553,26 @@ void setup() {
     // Инициализация BLE
     Serial.println("1. Initializing BLE...");
     NimBLEDevice::init("M5 BLE KB");
+    
+    // Настраиваем BLE для лучшей производительности
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::setMTU(185);  // Оптимальный MTU
+    
+    // Настраиваем сканер согласно документации
+    pScan = NimBLEDevice::getScan();
+    if (scanCallbacks != nullptr) {
+        delete scanCallbacks;
+    }
+    scanCallbacks = new MyScanCallbacks();
+    pScan->setScanCallbacks(scanCallbacks, true);
+    pScan->setActiveScan(true);
+    pScan->setInterval(40);    // 25ms
+    pScan->setWindow(20);      // 12.5ms
+    pScan->clearResults();                    // Очищаем предыдущие результаты
+    pScan->setFilterPolicy(BLE_HCI_SCAN_FILT_NO_WL);  // Отключаем фильтр
+    pScan->setDuplicateFilter(false);        // Разрешаем дубликаты
+    
+    Serial.printf("BLE initialized, MTU: %d\n", NimBLEDevice::getMTU());
     
     // Настройки безопасности
     Serial.println("2. Setting up security...");
@@ -170,9 +585,14 @@ void setup() {
     Serial.println("3. Creating server...");
     bleServer = NimBLEDevice::createServer();
     bleServer->setCallbacks(new ServerCallbacks());
-    Serial.printf("Server address: %s\n", NimBLEDevice::getAddress().toString().c_str());
     
-    // HID сервис
+    // Ждем инициализации колбэков
+    delay(100);
+    
+    // Проверяем состояние
+    Serial.printf("Server ready: %s\n", bleServer->getConnectedCount() == 0 ? "Yes" : "No");
+    
+    // Только потом создаем HID
     Serial.println("4. Setting up HID service...");
     hid = new NimBLEHIDDevice(bleServer);
     hid->setManufacturer("M5Stack");
@@ -202,6 +622,42 @@ void setup() {
     
     pAdvertising->start();
     Serial.println("=== Setup complete ===\n");
+    
+    // Проверяем состояние BLE согласно документации NimBLE
+    Serial.println("\n=== Checking BLE Status ===");
+    Serial.printf("BLE Address: %s\n", NimBLEDevice::getAddress().toString().c_str());
+    Serial.printf("TX Power: %d\n", NimBLEDevice::getPower());
+    
+    // Проверяем состояние сканера
+    pScan = NimBLEDevice::getScan();
+    pScan->setActiveScan(true);
+    pScan->setInterval(160);    // 100ms (160 * 0.625ms)
+    pScan->setWindow(80);       // 50ms (80 * 0.625ms)
+    pScan->setScanCallbacks(new MyScanCallbacks());
+    
+    // Инициализируем NVS
+    preferences.begin(PREF_NAMESPACE, false);
+    
+    // Проверяем предыдущее состояние
+    bool wasLocked = preferences.getBool(KEY_IS_LOCKED, false);
+    String lastAddress = preferences.getString(KEY_LAST_ADDR, "");
+    
+    // Явно устанавливаем начальное состояние как NORMAL
+    currentState = NORMAL;  
+    
+    // Только если было заблокировано и есть адрес - восстанавливаем состояние
+    if (wasLocked && !lastAddress.isEmpty()) {
+        currentState = LOCKED;
+        connectedDeviceAddress = lastAddress.c_str();
+        Serial.println("\n=== Previous state was LOCKED ===");
+        Serial.printf("Last connected device: %s\n", lastAddress.c_str());
+    } else {
+        // Сбрасываем флаг блокировки если что-то не так
+        preferences.putBool(KEY_IS_LOCKED, false);
+    }
+    
+    // Начинаем в режиме HID
+    scanMode = false;
 }
 
 void loop() {
@@ -209,10 +665,11 @@ void loop() {
     static unsigned long lastCheck = 0;
     static unsigned long lastRssiCheck = 0;
     static bool lastRealState = false;
+    static unsigned long lastDebugCheck = 0;
     
     M5.update();
     
-    // Оставляем существующую проверку статуса
+    // Оставляем только важные сообщения
     if (millis() - lastCheck >= 500) {
         lastCheck = millis();
         bool realConnected = bleServer->getConnectedCount() > 0;
@@ -220,156 +677,300 @@ void loop() {
         if (realConnected != lastRealState) {
             lastRealState = realConnected;
             connected = realConnected;
-            Serial.printf("Connection state changed and synced: %d\n", connected);
+            
+            if (connected) {
+                NimBLEConnInfo connInfo = bleServer->getPeerInfo(0);
+                connectedDeviceAddress = connInfo.getAddress().toString();
+                
+                pScan = NimBLEDevice::getScan();
+                pScan->stop();
+                delay(100);
+                
+                pScan->setActiveScan(true);
+                pScan->setInterval(40);
+                pScan->setWindow(20);
+                pScan->setScanCallbacks(scanCallbacks, true);
+                pScan->clearResults();
+                pScan->setFilterPolicy(BLE_HCI_SCAN_FILT_NO_WL);
+                pScan->setDuplicateFilter(false);
+                
+                if(pScan->start(0, false)) {
+                    scanMode = true;
+                }
+            }
             updateDisplay();
         }
-        
-        Serial.printf("Status Check - Connected flag: %d, Real count: %d\n", 
-                     connected, bleServer->getConnectedCount());
     }
     
-    // Обновляем экран как обычно
+    // Обновляем экран каждые 100мс
     if (millis() - lastUpdate >= 100) {
         lastUpdate = millis();
-        
-        Disbuff->fillSprite(BLACK);
-        Disbuff->setTextColor(connected ? GREEN : RED);
-        Disbuff->setCursor(10, 10);
-        Disbuff->printf("BLE:");
-        Disbuff->setCursor(10, 35);
-        Disbuff->printf("%s", connected ? "Connected" : "Waiting");
-        
-        if (connected) {
-            Disbuff->setTextColor(WHITE);
-            Disbuff->setCursor(10, 60);
-            Disbuff->printf("Count: %d", bleServer->getConnectedCount());
-            Disbuff->setCursor(10, 85);
-            Disbuff->printf("RSSI: %d", lastAverageRssi);
+        updateDisplay();
+    }
+    
+    // Убираем обновление экрана из режима сканирования
+    if (scanMode) {
+        static unsigned long lastResultsCheck = 0;
+        if (millis() - lastResultsCheck >= 200) {
+            lastResultsCheck = millis();
+            
+            // Сначала останавливаем
+            pScan->stop();
+            delay(10);  // Даем время на остановку
+            
+            // Получаем результаты
+            NimBLEScanResults results = NimBLEDevice::getScan()->getResults();
+            if (results.getCount() > 0) {
+                const NimBLEAdvertisedDevice* device = results.getDevice(0);
+                if (device && device->getAddress().toString() == connectedDeviceAddress) {
+                    lastAverageRssi = device->getRSSI();
+                    
+                    // Добавляем в массив для усреднения
+                    addRssiValue(lastAverageRssi);
+                    
+                    // Вычисляем и выводим среднее
+                    int avgRssi = getAverageRssi();
+                    
+                    updateDisplay();
+                }
+            }
+            
+            // Очищаем и перезапускаем
+            pScan->clearResults();
+            pScan->start(0, false);
         }
-        
-        Disbuff->pushSprite(0, 0);
     }
     
     // Обработка кнопки A для теста
-    if (M5.BtnA.wasPressed()) {
-        Serial.println("Button A pressed");
-        Serial.printf("Connected state: %d\n", connected);
-        
+    if (M5.BtnA.wasPressed() && M5.BtnB.wasPressed()) {  // Нажаты обе кнопки
         if (connected) {
-            Serial.println("Sending key 'a'");
-            uint8_t msg[] = {0, 0, 4, 0, 0, 0, 0, 0}; // Код клавиши 'a'
-            hid->getInputReport(1)->setValue(msg, sizeof(msg));
-            hid->getInputReport(1)->notify();
-            
-            delay(50);  // Увеличиваем задержку между нажатием и отпусканием
-            
-            Serial.println("Releasing key");
-            uint8_t msg2[] = {0, 0, 0, 0, 0, 0, 0, 0};
-            hid->getInputReport(1)->setValue(msg2, sizeof(msg2));
-            hid->getInputReport(1)->notify();
-            
-            delay(50);  // Добавляем задержку после отпускания
+            setPasswordFromSerial();  // Входим в режим настройки пароля
+        }
+    }
+    else if (M5.BtnA.wasPressed()) {
+        if (currentState == LOCKED) {
+            Serial.println("Manual unlock requested");
+            unlockComputer();
+        }
+    }
+    else if (M5.BtnB.wasPressed()) {
+        if (connected && currentState == NORMAL) {
+            Serial.println("Manual lock requested");
+            lockComputer();
+            currentState = LOCKED;
         }
     }
     
-    // В обработчике кнопки B будем переключать режимы
-    if (M5.BtnB.wasPressed()) {
-        if (!scanMode) {
-            // Переключаемся в режим сканирования
-            Serial.println("Switching to scan mode...");
-            
-            // 1. Останавливаем все активные операции
-            if (connected) {
-                bleServer->disconnect(0);
+    // Проверяем статус подключения
+    if (bleServer && bleServer->getConnectedCount() > 0) {
+        if (!connection_info.connected) {
+            // Получаем информацию о подключении
+            ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(0, &desc) == 0) {
+                connection_info.connected = true;
+                connection_info.conn_handle = desc.conn_handle;
+                connection_info.address = NimBLEAddress(desc.peer_ota_addr).toString();
+                
+                connectedDeviceAddress = connection_info.address;
             }
-            bleServer->stopAdvertising();
-            delay(100);  // Даем время на остановку
-            
-            // 2. Очищаем сканер перед запуском
-            NimBLEScan* pScan = NimBLEDevice::getScan();
-            pScan->clearResults();
+        }
+    } else {
+        connection_info.connected = false;
+        connection_info.conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        connection_info.address = "";
+    }
+    
+    // Добавляем отладочную информацию каждые 5 секунд
+    if (millis() - lastDebugCheck >= 5000) {
+        lastDebugCheck = millis();
+        
+        Serial.printf("\n=== Status Update ===\n");
+        Serial.printf("Connected: %d\n", connected);
+        Serial.printf("Current RSSI: %d\n", lastAverageRssi);
+        Serial.printf("State: %s\n", 
+            currentState == NORMAL ? "NORMAL" :
+            currentState == MOVING_AWAY ? "MOVING_AWAY" :
+            currentState == LOCKED ? "LOCKED" :
+            currentState == APPROACHING ? "APPROACHING" : "UNKNOWN");
+        Serial.printf("Password: %s\n", 
+            getPasswordForDevice(connectedDeviceAddress.c_str()).length() > 0 ? "SET" : "NOT SET");
+        Serial.println("===================\n");
+    }
+    
+    // Проверяем статус сканирования каждые 5 секунд
+    static unsigned long lastScanCheck = 0;
+    if (scanMode && millis() - lastScanCheck >= 5000) {
+        lastScanCheck = millis();
+        
+        NimBLEScan* pScan = NimBLEDevice::getScan();
+        if (!pScan->isScanning()) {
+            Serial.println("Scan stopped, restarting...");
             pScan->setActiveScan(true);
+            pScan->setInterval(0x50);
+            pScan->setWindow(0x30);
             
-            scanMode = true;
+            if(pScan->start(0)) {
+                Serial.println("Scan restarted successfully");
+            } else {
+                Serial.println("Failed to restart scan!");
+            }
+        }
+        Serial.println("========================\n");
+    }
+    
+    // В loop() добавляем обработку состояний
+    if (scanMode) {
+        static unsigned long lastResultsCheck = 0;
+        if (millis() - lastResultsCheck >= 200) {
+            lastResultsCheck = millis();
             
-            // 3. Запускаем сканирование
-            pScan->start(0);
-        } else {
-            Serial.println("\n=== Restoring HID Mode ===");
+            int avgRssi = getAverageRssi();
             
-            // 1. Останавливаем сканирование и ждем остановки
-            Serial.println("Stopping scan...");
-            NimBLEDevice::getScan()->stop();
-            delay(1000);  // Важно! Ждем полной остановки сканирования
+            // Отображаем статус на экране
+            Disbuff->setCursor(5, 85);
+            if (avgRssi > RSSI_NEAR_THRESHOLD) {
+                Disbuff->setTextColor(GREEN);
+                Disbuff->print("NEAR PC");
+            } else if (avgRssi > RSSI_LOCK_THRESHOLD) {
+                Disbuff->setTextColor(YELLOW);
+                Disbuff->print("WARNING");
+            } else {
+                Disbuff->setTextColor(RED);
+                Disbuff->print("FAR");
+            }
             
-            // 2. Останавливаем остальные операции
-            Serial.println("Stopping other operations...");
-            if (bleServer) {
-                bleServer->getAdvertising()->stop();
-                if (connected) {
-                    bleServer->disconnect(0);
+            // Проверяем необходимость блокировки
+            if (shouldLockComputer(avgRssi)) {
+                Serial.printf("\n!!! DISTANCE THRESHOLD REACHED !!!\n");
+                Serial.printf("Average RSSI: %d (Threshold: %d)\n", 
+                    avgRssi, RSSI_LOCK_THRESHOLD);
+                Serial.println("Sending lock command...");
+                
+                lockComputer();
+                currentState = LOCKED;
+            }
+        }
+    }
+    
+    // Проверяем состояние блокировки
+    if (currentState == LOCKED) {
+        if (getAverageRssi() > RSSI_NEAR_THRESHOLD) {
+            // Проверяем, прошло ли достаточно времени с последней попытки
+            if (millis() - lastUnlockAttempt >= UNLOCK_ATTEMPT_INTERVAL) {
+                lastUnlockAttempt = millis();
+                
+                // Проверяем наличие пароля перед попыткой разблокировки
+                if (getPasswordForDevice(connectedDeviceAddress.c_str()).length() > 0) {
+                    Serial.println("Device is near, attempting to unlock...");
+                    unlockComputer();
+                } else {
+                    Serial.println("Cannot unlock: no password stored. Use 'setpwd' command to set password.");
+                    // Показываем сообщение на экране
+                    Disbuff->fillSprite(BLACK);
+                    Disbuff->setTextColor(RED);
+                    Disbuff->setCursor(5, 40);
+                    Disbuff->print("NO PWD!");
+                    Disbuff->pushSprite(0, 0);
+                    delay(1000);
                 }
             }
-            delay(100);
-            
-            // 3. Освобождаем память
-            Serial.println("Cleaning up...");
-            if (hid) {
-                delete hid;
-                hid = nullptr;
-            }
-            bleServer = nullptr;
-            input = nullptr;
-            output = nullptr;
-            delay(100);
-            
-            // 4. Сбрасываем стек
-            Serial.println("Reinitializing BLE stack...");
-            NimBLEDevice::deinit();
-            delay(500);
-            
-            // 5. Инициализируем заново
-            NimBLEDevice::init("M5 BLE KB");
-            NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-            
-            // 6. Пересоздаем сервер и HID
-            Serial.println("Recreating server and HID...");
-            bleServer = NimBLEDevice::createServer();
-            bleServer->setCallbacks(new ServerCallbacks());
-            
-            hid = new NimBLEHIDDevice(bleServer);
-            hid->setManufacturer("M5Stack");
-            hid->setPnp(0x02, 0x05AC, 0x820A, 0x0001);
-            hid->setHidInfo(0x00, 0x01);
-            
-            input = hid->getInputReport(1);
-            output = hid->getOutputReport(1);
-            
-            hid->setReportMap((uint8_t*)hidReportDescriptor, sizeof(hidReportDescriptor));
-            hid->startServices();
-            
-            // 7. Запуск рекламы
-            Serial.println("Starting advertising...");
-            bleServer->getAdvertising()->start();
-            
-            scanMode = false;
-            Serial.println("=== Restore complete ===\n");
         }
     }
     
-    // В loop() добавим обработку режима сканирования
-    if (scanMode) {
-        // Показываем результаты сканирования
-        NimBLEScanResults results = NimBLEDevice::getScan()->getResults();
-        for(int i = 0; i < results.getCount(); i++) {
-            const NimBLEAdvertisedDevice* device = results.getDevice(i);
-            Serial.printf("Device: %s, RSSI: %d\n", 
-                device->getAddress().toString().c_str(),
-                device->getRSSI()
-            );
-        }
-        NimBLEDevice::getScan()->clearResults();
-    }
+    // Проверяем команды Serial
+    checkSerialCommands();
     
     delay(1);
+}
+
+void lockComputer() {
+    // Сохраняем текущую мощность
+    int8_t currentPower = NimBLEDevice::getPower();
+    
+    // Устанавливаем максимальную мощность
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    delay(100);
+    
+    // Пытаемся отправить команду несколько раз
+    bool success = false;
+    for(int attempt = 0; attempt < 3 && !success; attempt++) {
+        Serial.printf("Lock attempt %d, Power: %d, RSSI: %d\n", 
+            attempt + 1, NimBLEDevice::getPower(), lastAverageRssi);
+        
+        // Отправляем Win+L
+        uint8_t msg[] = {0x08, 0, 0x0F, 0, 0, 0, 0, 0};
+        input->setValue(msg, sizeof(msg));
+        success = input->notify();
+        
+        if (success) {
+            delay(50);
+            // Отпускаем клавиши
+            uint8_t release[] = {0, 0, 0, 0, 0, 0, 0, 0};
+            input->setValue(release, sizeof(release));
+            input->notify();
+            
+            Serial.println("Lock command sent successfully!");
+            break;
+        }
+        
+        delay(100);
+    }
+    
+    // Возвращаем исходную мощность
+    delay(100);
+    NimBLEDevice::setPower((esp_power_level_t)currentPower);
+    
+    if (success) {
+        // Сохраняем состояние блокировки и адрес устройства
+        preferences.putBool(KEY_IS_LOCKED, true);
+        preferences.putString(KEY_LAST_ADDR, connectedDeviceAddress.c_str());
+        Serial.println("Lock state saved to NVS");
+    }
+    
+    if (!success) {
+        Serial.println("Failed to send lock command!");
+    }
+}
+
+// Добавляем функцию разблокировки
+void unlockComputer() {
+    String password = getPasswordForDevice(connectedDeviceAddress.c_str());
+    if (password.length() == 0) {
+        Serial.println("No password stored for this device!");
+        return;
+    }
+    
+    // Сохраняем текущую мощность
+    int8_t currentPower = NimBLEDevice::getPower();
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    delay(100);
+    
+    bool success = false;
+    for(int attempt = 0; attempt < 3 && !success; attempt++) {
+        Serial.printf("Unlock attempt %d\n", attempt + 1);
+        
+        // 1. Отправляем Ctrl+Alt+Del
+        uint8_t ctrlAltDel[8] = {0x05, 0, 0x4C, 0, 0, 0, 0, 0};
+        input->setValue(ctrlAltDel, sizeof(ctrlAltDel));
+        success = input->notify();
+        
+        if (success) {
+            delay(2000);  // Ждем появления экрана входа
+            
+            // 2. Вводим пароль
+            typePassword(password);
+            
+            // 3. Сбрасываем состояние блокировки
+            preferences.putBool(KEY_IS_LOCKED, false);
+            preferences.remove(KEY_LAST_ADDR);
+            currentState = NORMAL;
+            
+            Serial.println("Computer unlocked successfully!");
+            break;
+        }
+        delay(100);
+    }
+    
+    // Возвращаем исходную мощность
+    NimBLEDevice::setPower((esp_power_level_t)currentPower);
 } 
