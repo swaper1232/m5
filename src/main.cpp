@@ -746,6 +746,53 @@ static const uint16_t SCAN_WINDOW_NORMAL = 20;       // 12.5ms
 static const uint16_t SCAN_INTERVAL_LOCKED = 320;    // 200ms - сканируем реже
 static const uint16_t SCAN_WINDOW_LOCKED = 16;       // 10ms - меньше слушаем
 
+// Добавим константы для яркости
+static const uint8_t BRIGHTNESS_MAX = 100;    // Максимальная яркость
+static const uint8_t BRIGHTNESS_NORMAL = 50;  // Нормальная яркость
+static const uint8_t BRIGHTNESS_LOW = 20;     // Пониженная яркость
+static const uint8_t BRIGHTNESS_MIN = 10;     // Минимальная яркость
+
+// Функция для управления яркостью в зависимости от мощности передатчика
+void adjustBrightness(esp_power_level_t txPower) {
+    static uint8_t currentBrightness = BRIGHTNESS_NORMAL;
+    uint8_t newBrightness;
+    
+    // Устанавливаем яркость в зависимости от мощности передатчика
+    switch (txPower) {
+        case ESP_PWR_LVL_N12:  // Минимальная мощность
+            newBrightness = BRIGHTNESS_MIN;
+            break;
+            
+        case ESP_PWR_LVL_N9:
+        case ESP_PWR_LVL_N6:
+            newBrightness = BRIGHTNESS_LOW;
+            break;
+            
+        case ESP_PWR_LVL_N3:
+        case ESP_PWR_LVL_N0:
+            newBrightness = BRIGHTNESS_NORMAL;
+            break;
+            
+        case ESP_PWR_LVL_P3:
+        case ESP_PWR_LVL_P6:
+        case ESP_PWR_LVL_P9:  // Максимальная мощность
+            newBrightness = BRIGHTNESS_MAX;
+            break;
+            
+        default:
+            newBrightness = BRIGHTNESS_NORMAL;
+    }
+
+    if (newBrightness != currentBrightness) {
+        if (serialOutputEnabled) {
+            Serial.printf("Adjusting brightness: %d -> %d (TX Power: %d)\n", 
+                currentBrightness, newBrightness, txPower);
+        }
+        M5.Display.setBrightness(newBrightness);
+        currentBrightness = newBrightness;
+    }
+}
+
 // Функция для настройки параметров сканирования
 void adjustScanParameters(DeviceState state) {
     if (!pScan) return;
@@ -799,6 +846,7 @@ void adjustTransmitPower(DeviceState state, int rssi) {
                 currentPower, newPower, state, rssi);
         }
         NimBLEDevice::setPower(newPower);
+        adjustBrightness(newPower);  // Регулируем яркость при изменении мощности
         currentPower = newPower;
     }
 }
