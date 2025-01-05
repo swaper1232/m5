@@ -750,7 +750,7 @@ static const uint16_t SCAN_WINDOW_LOCKED = 16;       // 10ms - меньше сл
 static const uint8_t BRIGHTNESS_MAX = 100;    // Максимальная яркость
 static const uint8_t BRIGHTNESS_NORMAL = 50;  // Нормальная яркость
 static const uint8_t BRIGHTNESS_LOW = 20;     // Пониженная яркость
-static const uint8_t BRIGHTNESS_MIN = 10;     // Минимальная яркость
+static const uint8_t BRIGHTNESS_MIN = 0;      // Выключенный экран
 
 // Функция для управления яркостью в зависимости от мощности передатчика
 void adjustBrightness(esp_power_level_t txPower) {
@@ -760,7 +760,7 @@ void adjustBrightness(esp_power_level_t txPower) {
     // Устанавливаем яркость в зависимости от мощности передатчика
     switch (txPower) {
         case ESP_PWR_LVL_N12:  // Минимальная мощность
-            newBrightness = BRIGHTNESS_MIN;
+            newBrightness = BRIGHTNESS_MIN;  // Выключаем экран
             break;
             
         case ESP_PWR_LVL_N9:
@@ -788,6 +788,12 @@ void adjustBrightness(esp_power_level_t txPower) {
             Serial.printf("Adjusting brightness: %d -> %d (TX Power: %d)\n", 
                 currentBrightness, newBrightness, txPower);
         }
+        
+        // Если экран был выключен и включается - обновляем дисплей
+        if (currentBrightness == BRIGHTNESS_MIN && newBrightness > BRIGHTNESS_MIN) {
+            updateDisplay();
+        }
+        
         M5.Display.setBrightness(newBrightness);
         currentBrightness = newBrightness;
     }
