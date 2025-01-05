@@ -78,6 +78,47 @@ enum DeviceState {
 static DeviceState currentState = NORMAL;
 static unsigned long movementStartTime = 0;
 
+// Изменяем константы для хранения паролей
+static const char* KEY_PWD_PREFIX = "pwd_";  // Префикс для ключей паролей
+static const int MAX_STORED_PASSWORDS = 5;   // Максимум сохраненных паролей
+
+// Добавим более сложный ключ шифрования (32 байта)
+static const uint8_t ENCRYPTION_KEY[] = {
+    0x89, 0x4E, 0x1C, 0xE7, 0x3A, 0x5D, 0x2B, 0xF8,
+    0x6C, 0x91, 0x0D, 0xB4, 0x7F, 0xE2, 0x9A, 0x3C,
+    0x5E, 0x8D, 0x1B, 0xF4, 0x6A, 0x2C, 0x9E, 0x0B,
+    0x7D, 0x4F, 0xA3, 0xE5, 0x8C, 0x1D, 0xB6, 0x3F
+};
+
+// Структура для хранения настроек устройства
+struct DeviceSettings {
+    int unlockRssi;     // Минимальный RSSI для разблокировки
+    int lockRssi;       // RSSI для блокировки
+    String password;    // Пароль (зашифрованный)
+};
+
+// Прототипы функций
+void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings);
+DeviceSettings getDeviceSettings(const String& deviceAddress);
+
+// Определения функций
+void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings) {
+    String key = String(KEY_PWD_PREFIX) + String(deviceAddress);
+    preferences.putInt((key + "_unlock_rssi").c_str(), settings.unlockRssi);
+    preferences.putInt((key + "_lock_rssi").c_str(), settings.lockRssi);
+    preferences.putString((key + "_pwd").c_str(), settings.password);
+}
+
+DeviceSettings getDeviceSettings(const String& deviceAddress) {
+    String key = String(KEY_PWD_PREFIX) + String(deviceAddress);
+    DeviceSettings settings;
+    // Значения по умолчанию если настройки не найдены
+    settings.unlockRssi = preferences.getInt((key + "_unlock_rssi").c_str(), RSSI_NEAR_THRESHOLD);
+    settings.lockRssi = preferences.getInt((key + "_lock_rssi").c_str(), RSSI_LOCK_THRESHOLD);
+    settings.password = preferences.getString((key + "_pwd").c_str(), "");
+    return settings;
+}
+
 // Стандартный дескриптор HID клавиатуры
 static const uint8_t hidReportDescriptor[] = {
     0x05, 0x01,  // Usage Page (Generic Desktop)
@@ -139,27 +180,31 @@ void addRssiValue(int rssi) {
     if (validSamples < RSSI_SAMPLES) validSamples++;
 }
 
+// После других static переменных, до функции updateDisplay()
+static int lastMovementCount = 0;  // Счетчик для отслеживания движения
+
 // Добавим функцию для обновления экрана
 void updateDisplay() {
     Disbuff->fillSprite(BLACK);
     Disbuff->setTextSize(2);
     
-    // Статус BLE (уменьшенный)
+    // BLE статус (5px)
     Disbuff->setTextColor(connected ? GREEN : RED);
     Disbuff->setCursor(5, 5);
     Disbuff->printf("BLE:%s", connected ? "OK" : "NO");
     
     if (connected) {
-        // RSSI информация
+        // RSSI (20px)
         Disbuff->setTextColor(WHITE);
-        Disbuff->setCursor(5, 25);
+        Disbuff->setCursor(5, 20);
         Disbuff->printf("RS:%d", lastAverageRssi);
         
-        Disbuff->setCursor(5, 45);
+        // Среднее RSSI (35px)
+        Disbuff->setCursor(5, 35);
         Disbuff->printf("AV:%d", getAverageRssi());
         
-        // Движение и состояние
-        Disbuff->setCursor(5, 65);
+        // Состояние (50px)
+        Disbuff->setCursor(5, 50);
         Disbuff->printf("ST:");
         switch (currentState) {
             case NORMAL: 
@@ -169,7 +214,7 @@ void updateDisplay() {
             case MOVING_AWAY: 
                 Disbuff->setTextColor(YELLOW);
                 Disbuff->printf("AWAY:%d", 
-                    (MOVEMENT_TIME - (millis() - movementStartTime)) / 1000); // Секунды до блокировки
+                    (MOVEMENT_TIME - (millis() - movementStartTime)) / 1000);
                 break;
             case LOCKED: 
                 Disbuff->setTextColor(RED);
@@ -181,16 +226,15 @@ void updateDisplay() {
                 break;
         }
         
-        // Счетчик движения
-        static int lastMovementCount = 0;
+        // Счетчик движения (65px)
         if (currentState == MOVING_AWAY) {
-            Disbuff->setCursor(5, 85);
+            Disbuff->setCursor(5, 65);
             Disbuff->setTextColor(YELLOW);
             Disbuff->printf("CNT:%d/%d", lastMovementCount, MOVEMENT_SAMPLES);
         }
         
-        // Разница RSSI
-        Disbuff->setCursor(5, 105);
+        // Разница RSSI (80px)
+        Disbuff->setCursor(5, 80);
         Disbuff->setTextColor(WHITE);
         static int lastRssiDiff = 0;
         if (currentState == MOVING_AWAY || currentState == NORMAL) {
@@ -207,8 +251,8 @@ void updateDisplay() {
             }
         }
         
-        // Индикатор уровня сигнала
-        Disbuff->setCursor(5, 125);
+        // Уровень сигнала (95px)
+        Disbuff->setCursor(5, 95);
         if (lastAverageRssi > -50) {
             Disbuff->setTextColor(GREEN);
             Disbuff->print("SIG:HIGH");
@@ -225,8 +269,8 @@ void updateDisplay() {
             }
         }
         
-        // Показываем наличие пароля
-        Disbuff->setCursor(5, 145);
+        // Пароль (110px)
+        Disbuff->setCursor(5, 110);
         if (getPasswordForDevice(connectedDeviceAddress.c_str()).length() > 0) {
             Disbuff->setTextColor(GREEN);
             Disbuff->print("PWD:OK");
@@ -338,37 +382,38 @@ static esp_ble_scan_params_t scan_params = {
 bool shouldLockComputer(int avgRssi) {
     if (!connected) return false;
     
+    // Не блокируем, если уже заблокировано
+    if (currentState == LOCKED) return false;
+    
     DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
     static bool wasNear = false;
     static int samplesBelow = 0;
+    static bool lockSent = false;  // Добавляем обратно флаг отправки
     
     // Используем индивидуальные настройки
     if (avgRssi > settings.unlockRssi) {
         wasNear = true;
         samplesBelow = 0;
+        lockSent = false;  // Сбрасываем флаг
+        return false;
     }
     
     if (wasNear && avgRssi < settings.lockRssi) {
         samplesBelow++;
-        if (samplesBelow >= SAMPLES_TO_CONFIRM) {
+        Serial.printf("Signal below threshold: %d/%d samples\n", 
+            samplesBelow, SAMPLES_TO_CONFIRM);
+            
+        // Если достаточно измерений подтверждают удаление
+        if (samplesBelow >= SAMPLES_TO_CONFIRM && !lockSent) {
+            Serial.println("!!! Lock condition detected !!!");
             return true;
         }
+    } else {
+        samplesBelow = 0;  // Сбрасываем счетчик если сигнал стал лучше
     }
     
     return false;
 }
-
-// Изменяем константы для хранения паролей
-static const char* KEY_PWD_PREFIX = "pwd_";  // Префикс для ключей паролей
-static const int MAX_STORED_PASSWORDS = 5;   // Максимум сохраненных паролей
-
-// Добавим более сложный ключ шифрования (32 байта)
-static const uint8_t ENCRYPTION_KEY[] = {
-    0x89, 0x4E, 0x1C, 0xE7, 0x3A, 0x5D, 0x2B, 0xF8,
-    0x6C, 0x91, 0x0D, 0xB4, 0x7F, 0xE2, 0x9A, 0x3C,
-    0x5E, 0x8D, 0x1B, 0xF4, 0x6A, 0x2C, 0x9E, 0x0B,
-    0x7D, 0x4F, 0xA3, 0xE5, 0x8C, 0x1D, 0xB6, 0x3F
-};
 
 // Объявляем прототипы функций
 String encryptPassword(const String& password);
@@ -507,6 +552,15 @@ static const char* DEFAULT_PASSWORD = "12345";  // Пример пароля
 void setPasswordFromSerial() {
     Serial.println("\n=== Password Setup ===");
     Serial.printf("Current device: %s\n", connectedDeviceAddress.c_str());
+    
+    // Проверяем текущий RSSI
+    int currentRssi = getAverageRssi();
+    if (currentRssi == 0 || currentRssi < -90) {
+        Serial.println("Error: Invalid RSSI reading. Please stay near computer.");
+        return;
+    }
+    
+    Serial.printf("Current RSSI: %d (Make sure you're at your normal working position)\n", currentRssi);
     Serial.println("Enter new password (end with newline):");
     
     String newPassword = "";
@@ -520,15 +574,26 @@ void setPasswordFromSerial() {
                 }
             } else {
                 newPassword += c;
-                Serial.print("*");  // Только звездочка
+                Serial.print("*");
             }
         }
         delay(10);
     }
     
     if (newPassword.length() > 0) {
-        savePasswordForDevice(connectedDeviceAddress.c_str(), newPassword);
-        Serial.println("Password saved");
+        // Сохраняем пароль и настройки RSSI
+        DeviceSettings settings;
+        settings.password = encryptPassword(newPassword);
+        settings.unlockRssi = currentRssi - 10;  // Разблокировка: чуть дальше от компьютера
+        settings.lockRssi = currentRssi - 25;    // Блокировка: заметное удаление
+        
+        saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
+        
+        Serial.println("Password and RSSI thresholds saved:");
+        Serial.printf("Base RSSI     : %d (current position)\n", currentRssi);
+        Serial.printf("Unlock RSSI   : %d (-%d from base)\n", settings.unlockRssi, 10);
+        Serial.printf("Lock RSSI     : %d (-%d from base)\n", settings.lockRssi, 25);
+        Serial.printf("Critical level: %d (-%d from base)\n", currentRssi - 35, 35);
     }
 }
 
@@ -572,11 +637,14 @@ void echoSerialInput() {
                         serialOutputEnabled ? "enabled" : "disabled");
                 } else if (inputBuffer == "help") {
                     Serial.println("\nAvailable commands:");
-                    Serial.println("setpwd - Set password for current device");
-                    Serial.println("getpwd - Show current password");
-                    Serial.println("list   - Show stored devices");
-                    Serial.println("silent - Toggle debug output");
-                    Serial.println("help   - Show this help");
+                    Serial.println("setpwd  - Set password for current device");
+                    Serial.println("getpwd  - Show current password");
+                    Serial.println("list    - Show stored devices");
+                    Serial.println("silent  - Toggle debug output");
+                    Serial.println("setrssl - Set RSSI threshold for locking");
+                    Serial.println("setrssu - Set RSSI threshold for unlocking");
+                    Serial.println("showrssi- Show current RSSI settings");
+                    Serial.println("help    - Show this help");
                 } else if (inputBuffer == "clear") {
                     clearAllPasswords();
                     Serial.println("All passwords cleared");
@@ -595,35 +663,51 @@ void echoSerialInput() {
                     Serial.println();
                     Serial.printf("Decrypted: %s\n", decrypted.c_str());
                     Serial.printf("Test %s\n", testPass == decrypted ? "PASSED" : "FAILED");
-                } else if (inputBuffer == "setrssl") {  // set RSSI Lock threshold
+                } else if (inputBuffer == "setrssl" || inputBuffer == "setrssu") {
                     if (connected) {
-                        Serial.println("Enter RSSI value for LOCK threshold (-30 to -90):");
-                        while (!Serial.available()) delay(10);
-                        int rssi = Serial.parseInt();
+                        bool isLock = (inputBuffer == "setrssl");
+                        Serial.printf("Enter RSSI value for %s threshold (-30 to -90):\n", 
+                            isLock ? "LOCK" : "UNLOCK");
+                        
+                        // Очищаем буфер Serial
+                        while(Serial.available()) {
+                            Serial.read();
+                        }
+                        
+                        String rssiStr = "";
+                        while (true) {
+                            if (Serial.available()) {
+                                char c = Serial.read();
+                                if (c == '\n' || c == '\r') {
+                                    if (rssiStr.length() > 0) {  // Проверяем, что что-то введено
+                                        break;
+                                    }
+                                } else {
+                                    rssiStr += c;
+                                    Serial.print(c);  // Эхо ввода
+                                }
+                            }
+                            delay(10);
+                        }
+                        
+                        int rssi = rssiStr.toInt();
                         if (rssi >= -90 && rssi <= -30) {
                             DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
-                            settings.lockRssi = rssi;
+                            if (isLock) {
+                                settings.lockRssi = rssi;
+                            } else {
+                                settings.unlockRssi = rssi;
+                            }
                             saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
-                            Serial.printf("Lock RSSI threshold set to %d\n", rssi);
+                            Serial.printf("\n%s RSSI threshold set to %d\n", 
+                                isLock ? "Lock" : "Unlock", rssi);
                         } else {
-                            Serial.println("Invalid RSSI value!");
+                            Serial.printf("\nInvalid RSSI value: %d! Must be between -90 and -30\n", rssi);
                         }
+                    } else {
+                        Serial.println("Error: No device connected!");
                     }
-                } else if (inputBuffer == "setrssu") {  // set RSSI Unlock threshold
-                    if (connected) {
-                        Serial.println("Enter RSSI value for UNLOCK threshold (-30 to -90):");
-                        while (!Serial.available()) delay(10);
-                        int rssi = Serial.parseInt();
-                        if (rssi >= -90 && rssi <= -30) {
-                            DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
-                            settings.unlockRssi = rssi;
-                            saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
-                            Serial.printf("Unlock RSSI threshold set to %d\n", rssi);
-                        } else {
-                            Serial.println("Invalid RSSI value!");
-                        }
-                    }
-                } else if (inputBuffer == "showrssi") {  // show current RSSI settings
+                } else if (inputBuffer == "showrssi") {
                     if (connected) {
                         DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
                         Serial.printf("\nDevice: %s\n", connectedDeviceAddress.c_str());
@@ -652,29 +736,48 @@ static unsigned long lastUnlockAttempt = 0;
 static int failedUnlockAttempts = 0;        // Счетчик неудачных попыток
 static unsigned long lastFailedAttempt = 0;  // Время последней неудачной попытки
 
-// Структура для хранения настроек устройства
-struct DeviceSettings {
-    int unlockRssi;     // Минимальный RSSI для разблокировки
-    int lockRssi;       // RSSI для блокировки
-    String password;    // Пароль (зашифрованный)
-};
+// Добавим константы для управления мощностью
+static const esp_power_level_t POWER_NEAR_PC = ESP_PWR_LVL_N12;    // Минимальная мощность когда рядом
+static const esp_power_level_t POWER_LOCKED = ESP_PWR_LVL_N6;      // Средняя мощность в режиме блокировки
+static const esp_power_level_t POWER_RETURNING = ESP_PWR_LVL_P9;   // Максимальная при возвращении
 
-// Функции для работы с настройками
-void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings) {
-    String key = String(KEY_PWD_PREFIX) + String(deviceAddress);
-    preferences.putInt((key + "_unlock_rssi").c_str(), settings.unlockRssi);
-    preferences.putInt((key + "_lock_rssi").c_str(), settings.lockRssi);
-    preferences.putString((key + "_pwd").c_str(), settings.password);
-}
+// Функция для адаптивного управления мощностью
+void adjustTransmitPower(DeviceState state, int rssi) {
+    static esp_power_level_t currentPower = ESP_PWR_LVL_P9;
+    esp_power_level_t newPower = currentPower;
 
-DeviceSettings getDeviceSettings(const String& deviceAddress) {
-    String key = String(KEY_PWD_PREFIX) + String(deviceAddress);
-    DeviceSettings settings;
-    // Значения по умолчанию если настройки не найдены
-    settings.unlockRssi = preferences.getInt((key + "_unlock_rssi").c_str(), RSSI_NEAR_THRESHOLD);
-    settings.lockRssi = preferences.getInt((key + "_lock_rssi").c_str(), RSSI_LOCK_THRESHOLD);
-    settings.password = preferences.getString((key + "_pwd").c_str(), "");
-    return settings;
+    switch (state) {
+        case NORMAL:
+            if (rssi > -50) {  // Очень близко к ПК
+                newPower = POWER_NEAR_PC;
+            } else if (rssi > -65) {  // Рабочее положение
+                newPower = ESP_PWR_LVL_N9;
+            } else {  // Начинаем удаляться
+                newPower = ESP_PWR_LVL_P3;
+            }
+            break;
+            
+        case LOCKED:
+            newPower = POWER_LOCKED;  // Экономим энергию в заблокированном состоянии
+            break;
+            
+        case APPROACHING:
+            newPower = POWER_RETURNING;  // Максимальная мощность для надежного соединения
+            break;
+            
+        case MOVING_AWAY:
+            newPower = ESP_PWR_LVL_P6;  // Повышенная мощность при удалении
+            break;
+    }
+
+    if (newPower != currentPower) {
+        if (serialOutputEnabled) {
+            Serial.printf("Adjusting power: %d -> %d (State: %d, RSSI: %d)\n", 
+                currentPower, newPower, state, rssi);
+        }
+        NimBLEDevice::setPower(newPower);
+        currentPower = newPower;
+    }
 }
 
 void setup() {
@@ -968,6 +1071,7 @@ void loop() {
             lastResultsCheck = millis();
             
             int avgRssi = getAverageRssi();
+            adjustTransmitPower(currentState, avgRssi);  // Добавляем здесь
             
             // Отображаем статус на экране
             Disbuff->setCursor(5, 85);
@@ -1027,10 +1131,8 @@ void loop() {
 }
 
 void lockComputer() {
-    // Сохраняем текущую мощность
-    int8_t currentPower = NimBLEDevice::getPower();
-    
-    // Устанавливаем максимальную мощность
+    // Временно увеличиваем мощность для надежной отправки команды
+    esp_power_level_t savedPower = (esp_power_level_t)NimBLEDevice::getPower();
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     delay(100);
     
@@ -1059,9 +1161,9 @@ void lockComputer() {
         delay(100);
     }
     
-    // Возвращаем исходную мощность
+    // После блокировки устанавливаем экономичную мощность
     delay(100);
-    NimBLEDevice::setPower((esp_power_level_t)currentPower);
+    NimBLEDevice::setPower(POWER_LOCKED);
     
     if (success) {
         // Сохраняем состояние блокировки и адрес устройства
