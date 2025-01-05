@@ -51,7 +51,6 @@ static std::string connectedDeviceAddress = "";
 static const int MOVEMENT_SAMPLES = 10;     // Сколько измерений для определения движения
 static const int MOVEMENT_THRESHOLD = 5;    // Порог изменения RSSI для движения (dBm)
 static const int MOVEMENT_TIME = 3000;      // Время движения для блокировки (3 секунды)
-static const int SCAN_INTERVAL_LOCKED = 3000; // Интервал сканирования в заблокированном режиме
 
 // Константы для определения потери сигнала
 static const int SIGNAL_LOSS_THRESHOLD = -75;  // dBm, критический уровень сигнала
@@ -737,9 +736,33 @@ static int failedUnlockAttempts = 0;        // Счетчик неудачных
 static unsigned long lastFailedAttempt = 0;  // Время последней неудачной попытки
 
 // Добавим константы для управления мощностью
-static const esp_power_level_t POWER_NEAR_PC = ESP_PWR_LVL_N12;    // Минимальная мощность когда рядом
-static const esp_power_level_t POWER_LOCKED = ESP_PWR_LVL_N6;      // Средняя мощность в режиме блокировки
-static const esp_power_level_t POWER_RETURNING = ESP_PWR_LVL_P9;   // Максимальная при возвращении
+static const esp_power_level_t POWER_NEAR_PC = ESP_PWR_LVL_N12;    // -12dBm минимальная
+static const esp_power_level_t POWER_LOCKED = ESP_PWR_LVL_N12;     // Меняем на минимальную в блоке
+static const esp_power_level_t POWER_RETURNING = ESP_PWR_LVL_P9;   // +9dBm максимальная
+
+// Оставляем новые константы для интервалов сканирования
+static const uint16_t SCAN_INTERVAL_NORMAL = 40;     // 25ms (40 * 0.625ms)
+static const uint16_t SCAN_WINDOW_NORMAL = 20;       // 12.5ms
+static const uint16_t SCAN_INTERVAL_LOCKED = 320;    // 200ms - сканируем реже
+static const uint16_t SCAN_WINDOW_LOCKED = 16;       // 10ms - меньше слушаем
+
+// Функция для настройки параметров сканирования
+void adjustScanParameters(DeviceState state) {
+    if (!pScan) return;
+    
+    if (state == LOCKED) {
+        pScan->setInterval(SCAN_INTERVAL_LOCKED);
+        pScan->setWindow(SCAN_WINDOW_LOCKED);
+    } else {
+        pScan->setInterval(SCAN_INTERVAL_NORMAL);
+        pScan->setWindow(SCAN_WINDOW_NORMAL);
+    }
+    
+    if (pScan->isScanning()) {
+        pScan->stop();
+    }
+    pScan->start(0, false);
+}
 
 // Функция для адаптивного управления мощностью
 void adjustTransmitPower(DeviceState state, int rssi) {
