@@ -4,19 +4,30 @@
 #include "esp_task_wdt.h"
 #include "esp_gap_ble_api.h"
 #include "NimBLEClient.h"
-#include <Preferences.h>
+#include <M5Unified.h>
+#include <nvs_flash.h>
+#include <nvs.h>
+
+// В начале файла после включений, до определения переменных
+void unlockComputer();
+void lockComputer();
+String getPasswordForDevice(const String& deviceAddress);
+void clearAllPreferences();
+
+// Глобальные переменные и определения
+extern nvs_handle_t nvsHandle;  // Объявляем как внешнюю переменную
+static const int RSSI_FAR_THRESHOLD = -65;
+
+// В начале файла, после всех включений и перед функциями
+
+// Добавляем константы для RSSI по умолчанию
+#define DEFAULT_LOCK_RSSI -60    // Порог RSSI для блокировки по умолчанию
+#define DEFAULT_UNLOCK_RSSI -45  // Порог RSSI для разблокировки по умолчанию
+
+// Добавляем глобальную переменную для управления отладочным выводом
+static bool serialOutputEnabled = true;
 
 // В начало файла после включения библиотек
-void lockComputer();
-void unlockComputer();
-String getPasswordForDevice(const String& deviceAddress);
-void savePasswordForDevice(const String& deviceAddress, const String& password);
-void setPasswordFromSerial();
-void checkSerialCommands();
-
-// Создаем объект для работы с NVS
-static Preferences preferences;
-static const char* PREF_NAMESPACE = "ble_lock";
 static const char* KEY_IS_LOCKED = "is_locked";
 static const char* KEY_LAST_ADDR = "last_addr";
 static const char* KEY_PASSWORD = "password";  // Добавляем константу для пароля
@@ -102,19 +113,49 @@ DeviceSettings getDeviceSettings(const String& deviceAddress);
 
 // Определения функций
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings) {
-    String key = String(KEY_PWD_PREFIX) + String(deviceAddress);
-    preferences.putInt((key + "_unlock_rssi").c_str(), settings.unlockRssi);
-    preferences.putInt((key + "_lock_rssi").c_str(), settings.lockRssi);
-    preferences.putString((key + "_pwd").c_str(), settings.password);
+    String shortKey = deviceAddress.substring(deviceAddress.length() - 8);
+    
+    esp_err_t err = nvs_set_str(nvsHandle, ("pwd_" + shortKey).c_str(), settings.password.c_str());
+    if (err != ESP_OK) {
+        Serial.printf("Error saving password: %d\n", err);
+        return;
+    }
+    
+    err = nvs_set_i32(nvsHandle, ("unlock_" + shortKey).c_str(), settings.unlockRssi);
+    if (err != ESP_OK) {
+        Serial.printf("Error saving unlock RSSI: %d\n", err);
+    }
+    
+    err = nvs_set_i32(nvsHandle, ("lock_" + shortKey).c_str(), settings.lockRssi);
+    if (err != ESP_OK) {
+        Serial.printf("Error saving lock RSSI: %d\n", err);
+    }
+    
+    nvs_commit(nvsHandle);
 }
 
 DeviceSettings getDeviceSettings(const String& deviceAddress) {
-    String key = String(KEY_PWD_PREFIX) + String(deviceAddress);
     DeviceSettings settings;
-    // Значения по умолчанию если настройки не найдены
-    settings.unlockRssi = preferences.getInt((key + "_unlock_rssi").c_str(), RSSI_NEAR_THRESHOLD);
-    settings.lockRssi = preferences.getInt((key + "_lock_rssi").c_str(), RSSI_LOCK_THRESHOLD);
-    settings.password = preferences.getString((key + "_pwd").c_str(), "");
+    settings.unlockRssi = RSSI_NEAR_THRESHOLD;
+    settings.lockRssi = RSSI_FAR_THRESHOLD;
+    
+    String shortKey = deviceAddress.substring(deviceAddress.length() - 8);
+    char pwd[64] = {0};
+    size_t length = sizeof(pwd);
+    
+    if (nvs_get_str(nvsHandle, ("pwd_" + shortKey).c_str(), pwd, &length) == ESP_OK) {
+        settings.password = String(pwd);
+    }
+    
+    int32_t value;
+    if (nvs_get_i32(nvsHandle, ("unlock_" + shortKey).c_str(), &value) == ESP_OK) {
+        settings.unlockRssi = value;
+    }
+    
+    if (nvs_get_i32(nvsHandle, ("lock_" + shortKey).c_str(), &value) == ESP_OK) {
+        settings.lockRssi = value;
+    }
+    
     return settings;
 }
 
@@ -184,6 +225,9 @@ static int lastMovementCount = 0;  // Счетчик для отслеживан
 
 // Добавим функцию для обновления экрана
 void updateDisplay() {
+    int8_t isLocked = 0;
+    nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &isLocked);
+    
     Disbuff->fillSprite(BLACK);
     Disbuff->setTextSize(2);
     
@@ -437,61 +481,59 @@ String decryptPassword(const String& encrypted) {
 }
 
 void clearAllPasswords() {
-    for (int i = 0; i < MAX_STORED_PASSWORDS; i++) {
-        String key = String(KEY_PWD_PREFIX) + String(i);
-        preferences.remove((key + "_addr").c_str());
-        preferences.remove((key + "_pwd").c_str());
-    }
+    nvs_erase_all(nvsHandle);
+    nvs_commit(nvsHandle);
+    Serial.println("All passwords cleared");
 }
 
 // Функция для получения пароля по адресу устройства
 String getPasswordForDevice(const String& deviceAddress) {
-    for (int i = 0; i < MAX_STORED_PASSWORDS; i++) {
-        String key = String(KEY_PWD_PREFIX) + String(i);
-        String addr = preferences.getString((key + "_addr").c_str(), "");
-        if (addr == deviceAddress) {
-            String encrypted = preferences.getString((key + "_pwd").c_str(), "");
-            return encrypted.length() > 0 ? decryptPassword(encrypted) : "";  // Расшифровываем при чтении
-        }
-    }
-    return "";
+    DeviceSettings settings = getDeviceSettings(deviceAddress);
+    return settings.password.length() > 0 ? decryptPassword(settings.password) : "";
 }
 
 // Функция для сохранения пароля
 void savePasswordForDevice(const String& deviceAddress, const String& password) {
-    int slot = -1;
-    for (int i = 0; i < MAX_STORED_PASSWORDS; i++) {
-        String key = String(KEY_PWD_PREFIX) + String(i);
-        String addr = preferences.getString((key + "_addr").c_str(), "");
-        if (addr == deviceAddress || addr.length() == 0) {
-            slot = i;
-            break;
-        }
-    }
+    DeviceSettings settings = getDeviceSettings(deviceAddress);
+    settings.password = encryptPassword(password);
+    saveDeviceSettings(deviceAddress, settings);
     
-    if (slot >= 0) {
-        String key = String(KEY_PWD_PREFIX) + String(slot);
-        preferences.putString((key + "_addr").c_str(), deviceAddress);
-        String encrypted = encryptPassword(password);  // Шифруем перед сохранением
-        preferences.putString((key + "_pwd").c_str(), encrypted);
-        Serial.println("Password saved");
-    } else {
-        Serial.println("No free slots!");
+    if (serialOutputEnabled) {
+        Serial.printf("Saving password for device: %s\n", deviceAddress.c_str());
+        Serial.printf("Password length: %d\n", password.length());
+        Serial.printf("Encrypted length: %d\n", settings.password.length());
     }
 }
 
-// Добавим функцию для просмотра сохраненных устройств
+// Функция для вывода списка устройств (обновим для новой системы)
 void listStoredDevices() {
     Serial.println("\nStored devices:");
     
-    // Проверяем каждое возможное устройство
-    for (int i = 0; i < MAX_STORED_PASSWORDS; i++) {
-        String key = String(KEY_PWD_PREFIX) + String(i);
-        String addr = preferences.getString((key + "_addr").c_str(), "");
-        if (addr.length() > 0) {
-            String pwd = preferences.getString((key + "_pwd").c_str(), "");
-            Serial.printf("%d. %s: %s\n", i + 1, addr.c_str(), 
-                pwd.length() > 0 ? "SET" : "NOT SET");
+    // Проверяем текущее подключенное устройство
+    if (connected) {
+        DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
+        
+        if (settings.password.length() > 0) {
+            Serial.printf("Current device: %s\n", connectedDeviceAddress.c_str());
+            Serial.printf("  Unlock RSSI: %d\n", settings.unlockRssi);
+            Serial.printf("  Lock RSSI: %d\n", settings.lockRssi);
+            Serial.printf("  Current RSSI: %d\n", lastAverageRssi);
+            Serial.printf("  Has password: YES\n");
+        }
+    }
+    
+    // Проверяем последнее заблокированное устройство
+    char lastAddr[32] = {0};
+    size_t length = sizeof(lastAddr);
+    if (nvs_get_str(nvsHandle, KEY_LAST_ADDR, lastAddr, &length) == ESP_OK) {
+        if (strlen(lastAddr) > 0 && strcmp(lastAddr, connectedDeviceAddress.c_str()) != 0) {
+            DeviceSettings settings = getDeviceSettings(lastAddr);
+            if (settings.password.length() > 0) {
+                Serial.printf("\nLast locked device: %s\n", lastAddr);
+                Serial.printf("  Unlock RSSI: %d\n", settings.unlockRssi);
+                Serial.printf("  Lock RSSI: %d\n", settings.lockRssi);
+                Serial.printf("  Has password: YES\n");
+            }
         }
     }
 }
@@ -551,53 +593,56 @@ static const char* DEFAULT_PASSWORD = "12345";  // Пример пароля
 void setPasswordFromSerial() {
     Serial.println("\n=== Password Setup ===");
     Serial.printf("Current device: %s\n", connectedDeviceAddress.c_str());
-    
-    // Проверяем текущий RSSI
-    int currentRssi = getAverageRssi();
-    if (currentRssi == 0 || currentRssi < -90) {
-        Serial.println("Error: Invalid RSSI reading. Please stay near computer.");
-        return;
-    }
-    
-    Serial.printf("Current RSSI: %d (Make sure you're at your normal working position)\n", currentRssi);
+    Serial.printf("Current RSSI: %d (Make sure you're at your normal working position)\n", lastAverageRssi);
     Serial.println("Enter new password (end with newline):");
     
-    String newPassword = "";
+    String password = "";
     while (true) {
         if (Serial.available()) {
             char c = Serial.read();
             if (c == '\n' || c == '\r') {
-                if (newPassword.length() > 0) {
-                    Serial.println();
+                if (password.length() > 0) {
                     break;
                 }
             } else {
-                newPassword += c;
-                Serial.print("*");
+                password += c;
+                Serial.print("*");  // Маскируем ввод звездочками
             }
         }
         delay(10);
     }
+    Serial.println();
     
-    if (newPassword.length() > 0) {
-        // Сохраняем пароль и настройки RSSI
-        DeviceSettings settings;
-        settings.password = encryptPassword(newPassword);
-        settings.unlockRssi = currentRssi - 10;  // Разблокировка: чуть дальше от компьютера
-        settings.lockRssi = currentRssi - 25;    // Блокировка: заметное удаление
-        
-        saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
-        
-        Serial.println("Password and RSSI thresholds saved:");
-        Serial.printf("Base RSSI     : %d (current position)\n", currentRssi);
-        Serial.printf("Unlock RSSI   : %d (-%d from base)\n", settings.unlockRssi, 10);
-        Serial.printf("Lock RSSI     : %d (-%d from base)\n", settings.lockRssi, 25);
-        Serial.printf("Critical level: %d (-%d from base)\n", currentRssi - 35, 35);
+    // Сохраняем пароль и настройки RSSI
+    DeviceSettings settings;
+    settings.password = encryptPassword(password);
+    
+    // Устанавливаем пороги RSSI относительно текущего уровня
+    int baseRssi = lastAverageRssi;
+    settings.unlockRssi = baseRssi - 10;
+    settings.lockRssi = baseRssi - 25;
+    
+    // Проверяем длину пароля перед сохранением
+    if (serialOutputEnabled) {
+        Serial.printf("Password length before encryption: %d\n", password.length());
+        Serial.printf("Password length after encryption: %d\n", settings.password.length());
     }
+    
+    saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
+    
+    // Проверяем сохранение
+    DeviceSettings checkSettings = getDeviceSettings(connectedDeviceAddress.c_str());
+    if (checkSettings.password.length() == 0) {
+        Serial.println("ERROR: Password was not saved correctly!");
+        return;
+    }
+    
+    Serial.println("Password and RSSI thresholds saved:");
+    Serial.printf("Base RSSI     : %d (current position)\n", baseRssi);
+    Serial.printf("Unlock RSSI   : %d (-10 from base)\n", settings.unlockRssi);
+    Serial.printf("Lock RSSI     : %d (-25 from base)\n", settings.lockRssi);
+    Serial.printf("Critical level: %d (-35 from base)\n", baseRssi - 35);
 }
-
-// Добавим флаг для управления выводом
-static bool serialOutputEnabled = true;
 
 // Добавим функцию для эхо ввода
 void echoSerialInput() {
@@ -607,7 +652,8 @@ void echoSerialInput() {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
             if (inputBuffer.length() > 0) {
-                Serial.println("\n=== Command execution ===");  // Добавим разделитель
+                Serial.println("\n=== Command execution ===");
+                
                 // Обрабатываем команду
                 if (inputBuffer == "setpwd") {
                     if (connected) {
@@ -621,7 +667,6 @@ void echoSerialInput() {
                         Serial.printf("Device: %s\n", connectedDeviceAddress.c_str());
                         if (pwd.length() > 0) {
                             Serial.println("Password is SET");
-                            // Serial.printf("Password: %s\n", pwd.c_str());  // Раскомментировать для отладки
                         } else {
                             Serial.println("Password is NOT SET");
                         }
@@ -643,10 +688,18 @@ void echoSerialInput() {
                     Serial.println("setrssl - Set RSSI threshold for locking");
                     Serial.println("setrssu - Set RSSI threshold for unlocking");
                     Serial.println("showrssi- Show current RSSI settings");
+                    Serial.println("unlock  - Clear lock state");
+                    Serial.println("clear   - Clear all stored preferences");
                     Serial.println("help    - Show this help");
+                } else if (inputBuffer == "unlock") {
+                    nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 0);
+                    nvs_commit(nvsHandle);
+                    currentState = NORMAL;
+                    Serial.println("Lock state cleared");
+                    updateDisplay();
                 } else if (inputBuffer == "clear") {
-                    clearAllPasswords();
-                    Serial.println("All passwords cleared");
+                    clearAllPreferences();
+                    Serial.println("All preferences cleared");
                 } else if (inputBuffer == "test") {
                     // Тест шифрования
                     String testPass = "MyTestPassword123";
@@ -717,7 +770,8 @@ void echoSerialInput() {
                 } else {
                     Serial.println("Unknown command. Type 'help' for available commands.");
                 }
-                Serial.println("=== End of command ===\n");    // Закрывающий разделитель
+                
+                Serial.println("=== End of command ===\n");
                 inputBuffer = "";
             }
         } else {
@@ -752,48 +806,113 @@ static const uint8_t BRIGHTNESS_NORMAL = 50;  // Нормальная яркос
 static const uint8_t BRIGHTNESS_LOW = 20;     // Пониженная яркость
 static const uint8_t BRIGHTNESS_MIN = 0;      // Выключенный экран
 
+// Добавляем после других static переменных
+static float batteryVoltage = 0;
+static float batteryLevel = 0;
+static const float VOLTAGE_THRESHOLD = -15.0;     // Допустимое падение напряжения
+static const float DISCONNECT_THRESHOLD = -25.0;   // Порог для определения отключения
+static const int VOLTAGE_HISTORY_SIZE = 10;
+static float voltageHistory[VOLTAGE_HISTORY_SIZE] = {0};
+static int historyIndex = 0;
+static bool historyFilled = false;
+static float maxAverageVoltage = 0;
+static bool wasConnected = true;
+
+// Функция обновления состояния питания
+void updatePowerStatus() {
+    // Обновляем базовые параметры
+    batteryVoltage = M5.Power.getBatteryVoltage();
+    batteryLevel = M5.Power.getBatteryLevel();
+    
+    // Обновляем историю измерений напряжения
+    voltageHistory[historyIndex] = batteryVoltage;
+    historyIndex = (historyIndex + 1) % VOLTAGE_HISTORY_SIZE;
+    if (historyIndex == 0) historyFilled = true;
+}
+
+float calculateAverageVoltage() {
+    float sum = 0;
+    int count = historyFilled ? VOLTAGE_HISTORY_SIZE : historyIndex;
+    if (count == 0) return 0;
+    
+    for (int i = 0; i < count; i++) {
+        sum += voltageHistory[i];
+    }
+    return sum / count;
+}
+
+bool isUSBConnected() {
+    if (!historyFilled && historyIndex < 3) return true;
+    
+    float avgVoltage = calculateAverageVoltage();
+    if (avgVoltage > maxAverageVoltage) {
+        maxAverageVoltage = avgVoltage;
+    }
+    
+    float voltageDrop = avgVoltage - maxAverageVoltage;
+    
+    if (wasConnected) {
+        if (voltageDrop < DISCONNECT_THRESHOLD) {
+            wasConnected = false;
+            return false;
+        }
+        return true;
+    } else {
+        if (voltageDrop > VOLTAGE_THRESHOLD) {
+            wasConnected = true;
+            return true;
+        }
+        return false;
+    }
+}
+
 // Функция для управления яркостью в зависимости от мощности передатчика
 void adjustBrightness(esp_power_level_t txPower) {
     static uint8_t currentBrightness = BRIGHTNESS_NORMAL;
     uint8_t newBrightness;
     
-    // Устанавливаем яркость в зависимости от мощности передатчика
-    switch (txPower) {
-        case ESP_PWR_LVL_N12:  // Минимальная мощность
-            newBrightness = BRIGHTNESS_MIN;  // Выключаем экран
-            break;
-            
-        case ESP_PWR_LVL_N9:
-        case ESP_PWR_LVL_N6:
-            newBrightness = BRIGHTNESS_LOW;
-            break;
-            
-        case ESP_PWR_LVL_N3:
-        case ESP_PWR_LVL_N0:
-            newBrightness = BRIGHTNESS_NORMAL;
-            break;
-            
-        case ESP_PWR_LVL_P3:
-        case ESP_PWR_LVL_P6:
-        case ESP_PWR_LVL_P9:  // Максимальная мощность
-            newBrightness = BRIGHTNESS_MAX;
-            break;
-            
-        default:
-            newBrightness = BRIGHTNESS_NORMAL;
+    // Если подключен USB - не выключаем экран
+    if (isUSBConnected()) {
+        switch (txPower) {
+            case ESP_PWR_LVL_N12:  // Минимальная мощность
+                newBrightness = BRIGHTNESS_LOW;  // Минимальная, но не выключаем
+                break;
+            case ESP_PWR_LVL_N9:
+            case ESP_PWR_LVL_N6:
+                newBrightness = BRIGHTNESS_LOW;
+                break;
+            default:
+                newBrightness = BRIGHTNESS_NORMAL;
+        }
+    } else {
+        // Обычная логика для работы от батареи
+        switch (txPower) {
+            case ESP_PWR_LVL_N12:  // Минимальная мощность
+                newBrightness = BRIGHTNESS_MIN;  // Выключаем экран
+                break;
+            case ESP_PWR_LVL_N9:
+            case ESP_PWR_LVL_N6:
+                newBrightness = BRIGHTNESS_LOW;
+                break;
+            case ESP_PWR_LVL_N3:
+            case ESP_PWR_LVL_N0:
+                newBrightness = BRIGHTNESS_NORMAL;
+                break;
+            case ESP_PWR_LVL_P3:
+            case ESP_PWR_LVL_P6:
+            case ESP_PWR_LVL_P9:
+                newBrightness = BRIGHTNESS_MAX;
+                break;
+            default:
+                newBrightness = BRIGHTNESS_NORMAL;
+        }
     }
 
     if (newBrightness != currentBrightness) {
         if (serialOutputEnabled) {
-            Serial.printf("Adjusting brightness: %d -> %d (TX Power: %d)\n", 
-                currentBrightness, newBrightness, txPower);
+            Serial.printf("Adjusting brightness: %d -> %d (TX Power: %d, USB: %d)\n", 
+                currentBrightness, newBrightness, txPower, isUSBConnected());
         }
-        
-        // Если экран был выключен и включается - обновляем дисплей
-        if (currentBrightness == BRIGHTNESS_MIN && newBrightness > BRIGHTNESS_MIN) {
-            updateDisplay();
-        }
-        
         M5.Display.setBrightness(newBrightness);
         currentBrightness = newBrightness;
     }
@@ -819,41 +938,109 @@ void adjustScanParameters(DeviceState state) {
 
 // Функция для адаптивного управления мощностью
 void adjustTransmitPower(DeviceState state, int rssi) {
-    static esp_power_level_t currentPower = ESP_PWR_LVL_P9;
-    esp_power_level_t newPower = currentPower;
-
-    switch (state) {
-        case NORMAL:
-            if (rssi > -50) {  // Очень близко к ПК
-                newPower = POWER_NEAR_PC;
-            } else if (rssi > -65) {  // Рабочее положение
-                newPower = ESP_PWR_LVL_N9;
-            } else {  // Начинаем удаляться
-                newPower = ESP_PWR_LVL_P3;
-            }
-            break;
-            
-        case LOCKED:
-            newPower = POWER_LOCKED;  // Экономим энергию в заблокированном состоянии
-            break;
-            
-        case APPROACHING:
-            newPower = POWER_RETURNING;  // Максимальная мощность для надежного соединения
-            break;
-            
-        case MOVING_AWAY:
-            newPower = ESP_PWR_LVL_P6;  // Повышенная мощность при удалении
-            break;
+    esp_power_level_t newPower;
+    
+    if (rssi > -35) {  // Очень близко
+        newPower = ESP_PWR_LVL_N12;  // Минимальная мощность
+    } else if (rssi > -45) {  // Близко
+        newPower = ESP_PWR_LVL_N9;
+    } else if (rssi > -55) {  // Средняя дистанция
+        newPower = ESP_PWR_LVL_N3;
+    } else if (rssi > -65) {  // Дальняя дистанция
+        newPower = ESP_PWR_LVL_P3;
+    } else {  // Очень далеко
+        newPower = ESP_PWR_LVL_P9;  // Максимальная мощность
     }
+    
+    NimBLEDevice::setPower(newPower);
+    adjustBrightness(newPower);  // Регулируем яркость
+}
 
-    if (newPower != currentPower) {
-        if (serialOutputEnabled) {
-            Serial.printf("Adjusting power: %d -> %d (State: %d, RSSI: %d)\n", 
-                currentPower, newPower, state, rssi);
-        }
-        NimBLEDevice::setPower(newPower);
-        adjustBrightness(newPower);  // Регулируем яркость при изменении мощности
-        currentPower = newPower;
+// В начале файла после определений
+nvs_handle_t nvsHandle;
+
+void initStorage() {
+    Serial.println("Initializing storage...");
+    esp_err_t err = nvs_open("m5kb_v1", NVS_READWRITE, &nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("Error opening NVS handle: %d\n", err);
+        return;
+    }
+    
+    // Проверяем есть ли начальные значения
+    int8_t isLocked;
+    err = nvs_get_i8(nvsHandle, "is_locked", &isLocked);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        // Устанавливаем начальные значения
+        nvs_set_i8(nvsHandle, "is_locked", 0);
+        nvs_set_str(nvsHandle, "last_addr", "");
+        nvs_commit(nvsHandle);
+        Serial.println("Initial values set");
+    }
+    
+    Serial.println("Storage initialized successfully");
+}
+
+void checkLockState() {
+    Serial.println("Checking lock state...");
+    
+    int8_t isLocked = 0;
+    char lastAddr[32] = {0};
+    size_t length = sizeof(lastAddr);
+    
+    esp_err_t err = nvs_get_i8(nvsHandle, "is_locked", &isLocked);
+    if (err != ESP_OK) {
+        Serial.printf("Error reading lock state: %d\n", err);
+        return;
+    }
+    
+    err = nvs_get_str(nvsHandle, "last_addr", lastAddr, &length);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        Serial.printf("Error reading last address: %d\n", err);
+        return;
+    }
+    
+    Serial.printf("Lock state: %s, Last addr: %s\n", 
+        isLocked ? "LOCKED" : "UNLOCKED", 
+        lastAddr);
+}
+
+// Функция для установки состояния блокировки
+void setLockState(bool locked) {
+    esp_err_t err = nvs_set_i8(nvsHandle, KEY_IS_LOCKED, locked ? 1 : 0);
+    if (err != ESP_OK) {
+        Serial.printf("Error setting lock state: %d\n", err);
+        return;
+    }
+    err = nvs_commit(nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("Error committing lock state: %d\n", err);
+    }
+}
+
+// Функция для получения состояния блокировки
+bool getLockState() {
+    int8_t locked = 0;
+    esp_err_t err = nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &locked);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        Serial.printf("Error getting lock state: %d\n", err);
+    }
+    return locked != 0;
+}
+
+// Функция для очистки всех настроек
+void clearAllSettings() {
+    Serial.println("Clearing all settings...");
+    esp_err_t err = nvs_erase_all(nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("Error clearing settings: %d\n", err);
+        return;
+    }
+    err = nvs_commit(nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("Error committing clear: %d\n", err);
+    } else {
+        Serial.println("All settings cleared");
     }
 }
 
@@ -873,6 +1060,27 @@ void setup() {
     Disbuff->setTextSize(2);
     
     Serial.println("=== Initial HID Setup ===");
+    
+    // Инициализируем NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        Serial.println("Erasing NVS flash...");
+        nvs_flash_erase();
+        ret = nvs_flash_init();
+    }
+    
+    if (ret != ESP_OK) {
+        Serial.printf("Failed to initialize NVS: %d\n", ret);
+        nvs_close(nvsHandle);  // Закрываем handle если была ошибка
+    } else {
+        Serial.println("NVS initialized successfully");
+        ret = nvs_open("m5kb_v1", NVS_READWRITE, &nvsHandle);
+        if (ret != ESP_OK) {
+            Serial.printf("Error opening NVS handle: %d\n", ret);
+        } else {
+            Serial.println("Storage initialized successfully");
+        }
+    }
     
     // Инициализация BLE
     Serial.println("1. Initializing BLE...");
@@ -960,29 +1168,41 @@ void setup() {
     pScan->setWindow(80);       // 50ms (80 * 0.625ms)
     pScan->setScanCallbacks(new MyScanCallbacks());
     
-    // Инициализируем NVS
-    preferences.begin(PREF_NAMESPACE, false);
-    
-    // Проверяем предыдущее состояние
-    bool wasLocked = preferences.getBool(KEY_IS_LOCKED, false);
-    String lastAddress = preferences.getString(KEY_LAST_ADDR, "");
-    
     // Явно устанавливаем начальное состояние как NORMAL
     currentState = NORMAL;  
     
-    // Только если было заблокировано и есть адрес - восстанавливаем состояние
-    if (wasLocked && !lastAddress.isEmpty()) {
-        currentState = LOCKED;
-        connectedDeviceAddress = lastAddress.c_str();
-        Serial.println("\n=== Previous state was LOCKED ===");
-        Serial.printf("Last connected device: %s\n", lastAddress.c_str());
-    } else {
-        // Сбрасываем флаг блокировки если что-то не так
-        preferences.putBool(KEY_IS_LOCKED, false);
+    // Проверяем предыдущее состояние
+    int8_t wasLocked = 0;
+    char lastAddr[32] = {0};
+    size_t length = sizeof(lastAddr);
+    
+    if (nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &wasLocked) == ESP_OK &&
+        nvs_get_str(nvsHandle, KEY_LAST_ADDR, lastAddr, &length) == ESP_OK) {
+        
+        if (wasLocked && strlen(lastAddr) > 0) {
+            currentState = LOCKED;
+            connectedDeviceAddress = lastAddr;
+            Serial.println("\n=== Previous state was LOCKED ===");
+            Serial.printf("Last connected device: %s\n", lastAddr);
+        } else {
+            nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 0);
+            nvs_commit(nvsHandle);
+        }
     }
     
     // Начинаем в режиме HID
     scanMode = false;
+    
+    // Добавим задержку
+    delay(100);
+    
+    // Инициализация истории измерений
+    updatePowerStatus();  // Получаем первое измерение
+    for (int i = 0; i < VOLTAGE_HISTORY_SIZE; i++) {
+        voltageHistory[i] = batteryVoltage;  // Заполняем историю текущим значением
+    }
+    historyFilled = true;
+    maxAverageVoltage = batteryVoltage;  // Инициализируем максимальное среднее
 }
 
 void loop() {
@@ -991,6 +1211,7 @@ void loop() {
     static unsigned long lastRssiCheck = 0;
     static bool lastRealState = false;
     static unsigned long lastDebugCheck = 0;
+    static unsigned long lastVoltageCheck = 0;
     
     M5.update();
     
@@ -1178,6 +1399,14 @@ void loop() {
     
     // Проверяем состояние блокировки
     if (currentState == LOCKED) {
+        static unsigned long lastCheck = 0;
+        const unsigned long CHECK_INTERVAL = 1000; // Проверяем раз в секунду
+        
+        if (millis() - lastCheck < CHECK_INTERVAL) {
+            return;  // Выходим если прошло мало времени
+        }
+        lastCheck = millis();
+        
         if (getAverageRssi() > RSSI_NEAR_THRESHOLD) {
             // Проверяем, прошло ли достаточно времени с последней попытки
             if (millis() - lastUnlockAttempt >= UNLOCK_ATTEMPT_INTERVAL) {
@@ -1198,6 +1427,22 @@ void loop() {
                     delay(1000);
                 }
             }
+        }
+    }
+    
+    // Обновляем состояние питания каждые 100мс
+    if (millis() - lastVoltageCheck >= 100) {
+        lastVoltageCheck = millis();
+        updatePowerStatus();
+        
+        // Используем isUSBConnected() для определения состояния USB
+        bool usbConnected = isUSBConnected();
+        
+        // Регулируем яркость в зависимости от состояния USB и режима
+        if (currentState == LOCKED && !usbConnected) {
+            M5.Display.setBrightness(BRIGHTNESS_MIN);
+        } else {
+            // ... существующая логика яркости ...
         }
     }
     
@@ -1244,8 +1489,8 @@ void lockComputer() {
     
     if (success) {
         // Сохраняем состояние блокировки и адрес устройства
-        preferences.putBool(KEY_IS_LOCKED, true);
-        preferences.putString(KEY_LAST_ADDR, connectedDeviceAddress.c_str());
+        nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 1);
+        nvs_commit(nvsHandle);
         Serial.println("Lock state saved to NVS");
     }
     
@@ -1256,9 +1501,19 @@ void lockComputer() {
 
 // Добавляем функцию разблокировки
 void unlockComputer() {
+    static unsigned long lastCheck = 0;
+    const unsigned long CHECK_INTERVAL = 1000; // Проверяем раз в секунду
+    
+    if (millis() - lastCheck < CHECK_INTERVAL) {
+        return;  // Выходим если прошло мало времени
+    }
+    lastCheck = millis();
+    
     String password = getPasswordForDevice(connectedDeviceAddress.c_str());
     if (password.length() == 0) {
-        Serial.println("No password stored for this device!");
+        if (serialOutputEnabled) {
+            Serial.println("Cannot unlock: no password stored. Use 'setpwd' command to set password.");
+        }
         return;
     }
     
@@ -1283,8 +1538,8 @@ void unlockComputer() {
             typePassword(password);
             
             // 3. Сбрасываем состояние блокировки
-            preferences.putBool(KEY_IS_LOCKED, false);
-            preferences.remove(KEY_LAST_ADDR);
+            nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 0);
+            nvs_commit(nvsHandle);
             currentState = NORMAL;
             
             Serial.println("Computer unlocked successfully!");
@@ -1314,4 +1569,59 @@ void unlockComputer() {
     } else {
         failedUnlockAttempts = 0;  // При успешной разблокировке сбрасываем счетчик
     }
+}
+
+void saveDeviceSettings(const char* deviceAddress, const DeviceSettings& settings) {
+    esp_err_t err = nvs_set_str(nvsHandle, "last_addr", deviceAddress);
+    if (err != ESP_OK) {
+        Serial.printf("Error saving device address: %d\n", err);
+        return;
+    }
+    
+    // Сохраняем настройки с коротким ключом
+    String shortKey = String(deviceAddress).substring(String(deviceAddress).length() - 8);
+    err = nvs_set_str(nvsHandle, ("pwd_" + shortKey).c_str(), settings.password.c_str());
+    if (err != ESP_OK) {
+        Serial.printf("Error saving password: %d\n", err);
+        return;
+    }
+    
+    err = nvs_set_i32(nvsHandle, ("unlock_" + shortKey).c_str(), settings.unlockRssi);
+    err |= nvs_set_i32(nvsHandle, ("lock_" + shortKey).c_str(), settings.lockRssi);
+    
+    err = nvs_commit(nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("Error committing settings: %d\n", err);
+    }
+}
+
+DeviceSettings getDeviceSettings(const char* deviceAddress) {
+    DeviceSettings settings;
+    String shortKey = String(deviceAddress).substring(String(deviceAddress).length() - 8);
+    
+    char pwd[64] = {0};
+    size_t length = sizeof(pwd);
+    esp_err_t err = nvs_get_str(nvsHandle, ("pwd_" + shortKey).c_str(), pwd, &length);
+    if (err == ESP_OK) {
+        settings.password = String(pwd);
+    }
+    
+    int32_t value;
+    err = nvs_get_i32(nvsHandle, ("unlock_" + shortKey).c_str(), &value);
+    if (err == ESP_OK) {
+        settings.unlockRssi = value;
+    }
+    
+    err = nvs_get_i32(nvsHandle, ("lock_" + shortKey).c_str(), &value);
+    if (err == ESP_OK) {
+        settings.lockRssi = value;
+    }
+    
+    return settings;
+}
+
+void clearAllPreferences() {
+    nvs_erase_all(nvsHandle);
+    nvs_commit(nvsHandle);
+    Serial.println("All preferences cleared");
 } 
