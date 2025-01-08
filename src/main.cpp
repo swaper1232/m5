@@ -1,4 +1,3 @@
-#include <M5StickCPlus2.h>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 #include "esp_task_wdt.h"
@@ -13,6 +12,7 @@ void unlockComputer();
 void lockComputer();
 String getPasswordForDevice(const String& deviceAddress);
 void clearAllPreferences();
+String cleanMacAddress(const char* macAddress);  // Добавляем прототип
 
 // Глобальные переменные и определения
 extern nvs_handle_t nvsHandle;  // Объявляем как внешнюю переменную
@@ -113,25 +113,43 @@ DeviceSettings getDeviceSettings(const String& deviceAddress);
 
 // Определения функций
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings) {
-    String shortKey = deviceAddress.substring(deviceAddress.length() - 8);
+    Serial.println("\n=== Saving Device Settings ===");
+    Serial.printf("Device address: %s\n", deviceAddress.c_str());
     
-    esp_err_t err = nvs_set_str(nvsHandle, ("pwd_" + shortKey).c_str(), settings.password.c_str());
+    String shortKey = cleanMacAddress(deviceAddress.c_str());
+    Serial.printf("Short key: %s\n", shortKey.c_str());
+    
+    String pwdKey = "pwd_" + shortKey;
+    String unlockKey = "unlock_" + shortKey;
+    String lockKey = "lock_" + shortKey;
+    
+    Serial.printf("Password key: %s\n", pwdKey.c_str());
+    Serial.printf("Unlock key: %s\n", unlockKey.c_str());
+    Serial.printf("Lock key: %s\n", lockKey.c_str());
+    
+    esp_err_t err = nvs_set_str(nvsHandle, pwdKey.c_str(), settings.password.c_str());
     if (err != ESP_OK) {
         Serial.printf("Error saving password: %d\n", err);
         return;
     }
     
-    err = nvs_set_i32(nvsHandle, ("unlock_" + shortKey).c_str(), settings.unlockRssi);
+    err = nvs_set_i32(nvsHandle, unlockKey.c_str(), settings.unlockRssi);
     if (err != ESP_OK) {
         Serial.printf("Error saving unlock RSSI: %d\n", err);
     }
     
-    err = nvs_set_i32(nvsHandle, ("lock_" + shortKey).c_str(), settings.lockRssi);
+    err = nvs_set_i32(nvsHandle, lockKey.c_str(), settings.lockRssi);
     if (err != ESP_OK) {
         Serial.printf("Error saving lock RSSI: %d\n", err);
     }
     
-    nvs_commit(nvsHandle);
+    err = nvs_commit(nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("Error committing settings: %d\n", err);
+    } else {
+        Serial.println("Settings saved successfully");
+    }
+    Serial.println("=== End Saving Settings ===\n");
 }
 
 DeviceSettings getDeviceSettings(const String& deviceAddress) {
@@ -139,7 +157,7 @@ DeviceSettings getDeviceSettings(const String& deviceAddress) {
     settings.unlockRssi = RSSI_NEAR_THRESHOLD;
     settings.lockRssi = RSSI_FAR_THRESHOLD;
     
-    String shortKey = deviceAddress.substring(deviceAddress.length() - 8);
+    String shortKey = cleanMacAddress(deviceAddress.c_str());
     char pwd[64] = {0};
     size_t length = sizeof(pwd);
     
@@ -505,37 +523,118 @@ void savePasswordForDevice(const String& deviceAddress, const String& password) 
     }
 }
 
-// Функция для вывода списка устройств (обновим для новой системы)
+// Вспомогательная функция для получения короткого ключа из MAC-адреса
+String getShortKey(const char* macAddress) {
+    // Убираем двоеточия и берем последние 8 символов
+    String cleanMac = String(macAddress);
+    cleanMac.replace(":", "");
+    return cleanMac.substring(cleanMac.length() - 8);
+}
+
+String cleanMacAddress(const char* macAddress) {
+    String result = String(macAddress);
+    result.replace(":", "");
+    return result.substring(result.length() - 8);
+}
+
 void listStoredDevices() {
     Serial.println("\nStored devices:");
+    Serial.println("=== Debug Info ===");
     
-    // Проверяем текущее подключенное устройство
+    String currentShortKey = "";
+    
+    // Показываем текущее подключенное устройство
+    Serial.println("Checking connected device:");
     if (connected) {
+        Serial.printf("  Connected device: %s\n", connectedDeviceAddress.c_str());
+        currentShortKey = cleanMacAddress(connectedDeviceAddress.c_str());
+        Serial.printf("  Short key: %s\n", currentShortKey.c_str());
+        
         DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
+        Serial.printf("  Password length: %d\n", settings.password.length());
         
         if (settings.password.length() > 0) {
-            Serial.printf("Current device: %s\n", connectedDeviceAddress.c_str());
+            Serial.printf("\nDevice: %s (CONNECTED)\n", connectedDeviceAddress.c_str());
             Serial.printf("  Unlock RSSI: %d\n", settings.unlockRssi);
             Serial.printf("  Lock RSSI: %d\n", settings.lockRssi);
             Serial.printf("  Current RSSI: %d\n", lastAverageRssi);
             Serial.printf("  Has password: YES\n");
         }
+    } else {
+        Serial.println("  No device connected");
     }
     
-    // Проверяем последнее заблокированное устройство
+    // Показываем последнее заблокированное устройство
+    Serial.println("\nChecking last locked device:");
     char lastAddr[32] = {0};
     size_t length = sizeof(lastAddr);
+    String lastShortKey = "";
+    
     if (nvs_get_str(nvsHandle, KEY_LAST_ADDR, lastAddr, &length) == ESP_OK) {
-        if (strlen(lastAddr) > 0 && strcmp(lastAddr, connectedDeviceAddress.c_str()) != 0) {
-            DeviceSettings settings = getDeviceSettings(lastAddr);
-            if (settings.password.length() > 0) {
-                Serial.printf("\nLast locked device: %s\n", lastAddr);
-                Serial.printf("  Unlock RSSI: %d\n", settings.unlockRssi);
-                Serial.printf("  Lock RSSI: %d\n", settings.lockRssi);
-                Serial.printf("  Has password: YES\n");
+        Serial.printf("  Last locked device: %s\n", lastAddr);
+        if (strlen(lastAddr) > 0) {
+            lastShortKey = cleanMacAddress(lastAddr);
+            Serial.printf("  Short key: %s\n", lastShortKey.c_str());
+            
+            if (!connected || strcmp(lastAddr, connectedDeviceAddress.c_str()) != 0) {
+                DeviceSettings settings = getDeviceSettings(lastAddr);
+                Serial.printf("  Password length: %d\n", settings.password.length());
+                
+                if (settings.password.length() > 0) {
+                    Serial.printf("\nDevice: %s (LAST LOCKED)\n", lastAddr);
+                    Serial.printf("  Unlock RSSI: %d\n", settings.unlockRssi);
+                    Serial.printf("  Lock RSSI: %d\n", settings.lockRssi);
+                    Serial.printf("  Has password: YES\n");
+                }
+            } else {
+                Serial.println("  Last locked device is current connected device");
+            }
+        } else {
+            Serial.println("  Last locked device is empty");
+        }
+    } else {
+        Serial.println("  No last locked device found");
+    }
+    
+    // Показываем все сохраненные устройства
+    Serial.println("\nChecking saved devices:");
+    nvs_iterator_t it = nvs_entry_find("nvs", "m5kb_v1", NVS_TYPE_STR);
+    while (it != NULL) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        String key = String(info.key);
+        
+        // Проверяем только ключи, начинающиеся с pwd_
+        if (key.startsWith("pwd_")) {
+            String shortKey = key.substring(4); // Убираем "pwd_"
+            shortKey.replace(":", ""); // Убираем двоеточия, если они есть
+            Serial.printf("Found device with key: %s\n", key.c_str());
+            
+            // Получаем пароль
+            char pwd[64];
+            size_t pwdLen = sizeof(pwd);
+            if (nvs_get_str(nvsHandle, key.c_str(), pwd, &pwdLen) == ESP_OK && strlen(pwd) > 0) {
+                // Получаем RSSI пороги
+                int32_t unlockRssi, lockRssi;
+                if (nvs_get_i32(nvsHandle, ("unlock_" + shortKey).c_str(), &unlockRssi) == ESP_OK &&
+                    nvs_get_i32(nvsHandle, ("lock_" + shortKey).c_str(), &lockRssi) == ESP_OK) {
+                    
+                    String status = "(SAVED)";
+                    if (shortKey == currentShortKey) status = "(CURRENT)";
+                    if (shortKey == lastShortKey) status = "(LAST LOCKED)";
+                    
+                    Serial.printf("\nDevice with key %s %s\n", shortKey.c_str(), status.c_str());
+                    Serial.printf("  Unlock RSSI: %d\n", unlockRssi);
+                    Serial.printf("  Lock RSSI: %d\n", lockRssi);
+                    Serial.printf("  Has password: YES\n");
+                }
             }
         }
+        it = nvs_entry_next(it);
     }
+    nvs_release_iterator(it);
+    
+    Serial.println("\n=== End Debug Info ===");
 }
 
 // Функция отправки одного символа
@@ -817,6 +916,9 @@ static int historyIndex = 0;
 static bool historyFilled = false;
 static float maxAverageVoltage = 0;
 static bool wasConnected = true;
+
+// После других static переменных
+static String currentShortKey = "";
 
 // Функция обновления состояния питания
 void updatePowerStatus() {
@@ -1572,6 +1674,9 @@ void unlockComputer() {
 }
 
 void saveDeviceSettings(const char* deviceAddress, const DeviceSettings& settings) {
+    Serial.println("\n=== Saving Device Settings ===");
+    Serial.printf("Device address: %s\n", deviceAddress);
+    
     esp_err_t err = nvs_set_str(nvsHandle, "last_addr", deviceAddress);
     if (err != ESP_OK) {
         Serial.printf("Error saving device address: %d\n", err);
@@ -1580,19 +1685,32 @@ void saveDeviceSettings(const char* deviceAddress, const DeviceSettings& setting
     
     // Сохраняем настройки с коротким ключом
     String shortKey = String(deviceAddress).substring(String(deviceAddress).length() - 8);
-    err = nvs_set_str(nvsHandle, ("pwd_" + shortKey).c_str(), settings.password.c_str());
+    Serial.printf("Short key: %s\n", shortKey.c_str());
+    
+    String pwdKey = "pwd_" + shortKey;
+    Serial.printf("Password key: %s\n", pwdKey.c_str());
+    
+    err = nvs_set_str(nvsHandle, pwdKey.c_str(), settings.password.c_str());
     if (err != ESP_OK) {
         Serial.printf("Error saving password: %d\n", err);
         return;
     }
     
-    err = nvs_set_i32(nvsHandle, ("unlock_" + shortKey).c_str(), settings.unlockRssi);
-    err |= nvs_set_i32(nvsHandle, ("lock_" + shortKey).c_str(), settings.lockRssi);
+    String unlockKey = "unlock_" + shortKey;
+    String lockKey = "lock_" + shortKey;
+    Serial.printf("Unlock key: %s\n", unlockKey.c_str());
+    Serial.printf("Lock key: %s\n", lockKey.c_str());
+    
+    err = nvs_set_i32(nvsHandle, unlockKey.c_str(), settings.unlockRssi);
+    err |= nvs_set_i32(nvsHandle, lockKey.c_str(), settings.lockRssi);
     
     err = nvs_commit(nvsHandle);
     if (err != ESP_OK) {
         Serial.printf("Error committing settings: %d\n", err);
+    } else {
+        Serial.println("Settings saved successfully");
     }
+    Serial.println("=== End Saving Settings ===\n");
 }
 
 DeviceSettings getDeviceSettings(const char* deviceAddress) {
