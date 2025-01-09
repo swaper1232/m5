@@ -7,6 +7,19 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 
+// Добавляем эти строки сразу после включений
+#define RSSI_HISTORY_SIZE 10
+
+struct RssiMeasurement {
+    int value;
+    uint32_t timestamp;
+    bool isValid;
+};
+
+static RssiMeasurement rssiHistory[RSSI_HISTORY_SIZE] = {};
+static int rssiHistoryIndex = 0;
+static int lastAverageRssi = 0;
+
 // В начале файла после включений, до определения переменных
 void unlockComputer();
 void lockComputer();
@@ -42,7 +55,7 @@ struct {
 } connection_info;
 
 static NimBLEAdvertisementData advData;
-static NimBLEServer* bleServer;
+static NimBLEServer* bleServer = nullptr;
 static NimBLEHIDDevice* hid;
 static NimBLECharacteristic* input;
 static NimBLECharacteristic* output;
@@ -50,7 +63,6 @@ static bool connected = false;
 static M5Canvas* Disbuff = nullptr;  // Буфер для отрисовки
 static int16_t lastReceivedRssi = 0;
 static String lastMovement = "==";
-static int lastAverageRssi = 0;
 
 // Добавим переменную для режима работы
 static bool scanMode = false;
@@ -107,9 +119,12 @@ struct DeviceSettings {
     String password;    // Пароль (зашифрованный)
 };
 
+
+
 // Прототипы функций
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings);
 DeviceSettings getDeviceSettings(const String& deviceAddress);
+void addRssiMeasurement(const RssiMeasurement& measurement);
 
 // Определения функций
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings) {
@@ -262,7 +277,7 @@ void updateDisplay() {
         
         // Среднее RSSI (35px)
         Disbuff->setCursor(5, 35);
-        Disbuff->printf("AV:%d", getAverageRssi());
+        Disbuff->printf("AV:%d", lastAverageRssi);
         
         // Состояние (50px)
         Disbuff->setCursor(5, 50);
@@ -298,8 +313,10 @@ void updateDisplay() {
         Disbuff->setCursor(5, 80);
         Disbuff->setTextColor(WHITE);
         static int lastRssiDiff = 0;
+        static int previousRssi = 0;
+        lastRssiDiff = lastAverageRssi - previousRssi;
+        previousRssi = lastAverageRssi;
         if (currentState == MOVING_AWAY || currentState == NORMAL) {
-            lastRssiDiff = getAverageRssi() - lastAverageRssi;
             if (lastRssiDiff < 0) {
                 Disbuff->setTextColor(RED);    // Красный для удаления
                 Disbuff->printf("<<:%d", abs(lastRssiDiff));  // Стрелки влево
@@ -346,24 +363,45 @@ void updateDisplay() {
 
 // Сначала объявляем класс для колбэков сканирования
 class MyScanCallbacks: public NimBLEScanCallbacks {
+private:
+    NimBLEAdvertisedDevice* targetDevice = nullptr;
+    
+public:
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
-        // Проверяем адрес устройства
-        if (advertisedDevice->getAddress().toString() == connectedDeviceAddress) {
-            int rssi = advertisedDevice->getRSSI();
-            lastAverageRssi = rssi;
-            updateDisplay();
-            addRssiValue(rssi);
+        // Проверяем, является ли это HID устройством
+        if (advertisedDevice->isAdvertisingService(NimBLEUUID("1812"))) {  // 0x1812 - HID Service
+            if (serialOutputEnabled) {
+                Serial.printf("\nFound HID device: %s, RSSI: %d\n", 
+                    advertisedDevice->getAddress().toString().c_str(),
+                    advertisedDevice->getRSSI());
+            }
+            
+            // Сохраняем устройство и останавливаем сканирование
+            if (targetDevice != nullptr) {
+                delete targetDevice;
+            }
+            targetDevice = new NimBLEAdvertisedDevice(*advertisedDevice);
+            NimBLEDevice::getScan()->stop();
+            
+            // Пытаемся подключиться
+            if (bleServer && !connected) {
+                connectedDeviceAddress = targetDevice->getAddress().toString();
+                connected = true;
+                updateDisplay();
+            }
         }
     }
-
-    void onScanEnd(NimBLEScanResults results) {
-        // Можно полностью убрать этот метод, если он не нужен
+    
+    ~MyScanCallbacks() {
+        if (targetDevice != nullptr) {
+            delete targetDevice;
+        }
     }
 };
 
 // Затем объявляем глобальные переменные
 static NimBLEScan* pScan = nullptr;
-static MyScanCallbacks* scanCallbacks = nullptr;
+static MyScanCallbacks* scanCallbacks = new MyScanCallbacks();
 
 // Затем класс для колбэков сервера
 class ServerCallbacks : public NimBLEServerCallbacks {
@@ -905,6 +943,10 @@ static const uint8_t BRIGHTNESS_NORMAL = 50;  // Нормальная яркос
 static const uint8_t BRIGHTNESS_LOW = 20;     // Пониженная яркость
 static const uint8_t BRIGHTNESS_MIN = 0;      // Выключенный экран
 
+// Добавляем константы для яркости в начало файла
+static const uint8_t BRIGHTNESS_USB = 100;     // Яркость при USB питании
+static const uint8_t BRIGHTNESS_BATTERY = 30;  // Яркость от батареи
+
 // Добавляем после других static переменных
 static float batteryVoltage = 0;
 static float batteryLevel = 0;
@@ -930,6 +972,31 @@ void updatePowerStatus() {
     voltageHistory[historyIndex] = batteryVoltage;
     historyIndex = (historyIndex + 1) % VOLTAGE_HISTORY_SIZE;
     if (historyIndex == 0) historyFilled = true;
+    
+    static bool wasUSB = true;
+    bool isUSB = M5.Power.isCharging();
+    
+    // Добавим защиту от частых изменений
+    static unsigned long lastChange = 0;
+    if (millis() - lastChange < 1000) {  // Минимум 1 секунда между изменениями
+        return;
+    }
+    
+    if (wasUSB != isUSB) {
+        lastChange = millis();
+        wasUSB = isUSB;
+        
+        // Устанавливаем яркость с задержкой
+        delay(10);
+        M5.Display.setBrightness(isUSB ? BRIGHTNESS_USB : BRIGHTNESS_BATTERY);
+        delay(10);
+        
+        if (serialOutputEnabled) {
+            Serial.printf("Power source changed: %s, brightness: %d\n",
+                isUSB ? "USB" : "Battery",
+                isUSB ? BRIGHTNESS_USB : BRIGHTNESS_BATTERY);
+        }
+    }
 }
 
 float calculateAverageVoltage() {
@@ -995,15 +1062,6 @@ void adjustBrightness(esp_power_level_t txPower) {
             case ESP_PWR_LVL_N9:
             case ESP_PWR_LVL_N6:
                 newBrightness = BRIGHTNESS_LOW;
-                break;
-            case ESP_PWR_LVL_N3:
-            case ESP_PWR_LVL_N0:
-                newBrightness = BRIGHTNESS_NORMAL;
-                break;
-            case ESP_PWR_LVL_P3:
-            case ESP_PWR_LVL_P6:
-            case ESP_PWR_LVL_P9:
-                newBrightness = BRIGHTNESS_MAX;
                 break;
             default:
                 newBrightness = BRIGHTNESS_NORMAL;
@@ -1146,6 +1204,9 @@ void clearAllSettings() {
     }
 }
 
+// В начале файла добавим глобальную переменную для хранения найденного устройства
+static NimBLEAdvertisedDevice* targetDevice = nullptr;
+
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
@@ -1192,22 +1253,6 @@ void setup() {
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     NimBLEDevice::setMTU(185);  // Оптимальный MTU
     
-    // Настраиваем сканер согласно документации
-    pScan = NimBLEDevice::getScan();
-    if (scanCallbacks != nullptr) {
-        delete scanCallbacks;
-    }
-    scanCallbacks = new MyScanCallbacks();
-    pScan->setScanCallbacks(scanCallbacks, true);
-    pScan->setActiveScan(true);
-    pScan->setInterval(40);    // 25ms
-    pScan->setWindow(20);      // 12.5ms
-    pScan->clearResults();                    // Очищаем предыдущие результаты
-    pScan->setFilterPolicy(BLE_HCI_SCAN_FILT_NO_WL);  // Отключаем фильтр
-    pScan->setDuplicateFilter(false);        // Разрешаем дубликаты
-    
-    Serial.printf("BLE initialized, MTU: %d\n", NimBLEDevice::getMTU());
-    
     // Настройки безопасности
     Serial.println("2. Setting up security...");
     NimBLEDevice::setSecurityAuth(
@@ -1221,26 +1266,19 @@ void setup() {
     bleServer = NimBLEDevice::createServer();
     bleServer->setCallbacks(new ServerCallbacks());
     
-    // Ждем инициализации колбэков
-    delay(100);
+    // Теперь настраиваем сканирование
+    pScan = NimBLEDevice::getScan();
+    pScan->setScanCallbacks(scanCallbacks);
+    pScan->setActiveScan(true);
+    pScan->setInterval(40);
+    pScan->setWindow(30);
     
-    // Проверяем состояние
-    Serial.printf("Server ready: %s\n", bleServer->getConnectedCount() == 0 ? "Yes" : "No");
+    if (serialOutputEnabled) {
+        Serial.println("Starting initial scan for HID devices...");
+    }
     
-    // Только потом создаем HID
-    Serial.println("4. Setting up HID service...");
-    hid = new NimBLEHIDDevice(bleServer);
-    hid->setManufacturer("M5Stack");
-    hid->setPnp(0x02, 0x05AC, 0x820A, 0x0001);
-    hid->setHidInfo(0x00, 0x01);
-    
-    // Получаем характеристики до запуска сервисов
-    Serial.println("Getting characteristics...");
-    input = hid->getInputReport(1);
-    output = hid->getOutputReport(1);
-    
-    hid->setReportMap((uint8_t*)hidReportDescriptor, sizeof(hidReportDescriptor));
-    hid->startServices();
+    // Запускаем начальное сканирование
+    pScan->start(0, false);
     
     // Настройка рекламы
     Serial.println("5. Starting advertising...");
@@ -1305,6 +1343,18 @@ void setup() {
     }
     historyFilled = true;
     maxAverageVoltage = batteryVoltage;  // Инициализируем максимальное среднее
+    
+    // Инициализация сканирования
+    pScan = NimBLEDevice::getScan();
+    pScan->setScanCallbacks(scanCallbacks);  // Устанавливаем колбэки до старта
+    pScan->setActiveScan(true);
+    pScan->setInterval(20);
+    pScan->setWindow(15);
+    pScan->setDuplicateFilter(false);
+    
+    if (serialOutputEnabled) {
+        Serial.println("Scan callbacks set");
+    }
 }
 
 void loop() {
@@ -1317,7 +1367,17 @@ void loop() {
     
     M5.update();
     
-    // Оставляем только важные сообщения
+    // Проверяем питание и яркость каждые 500мс
+    if (millis() - lastVoltageCheck >= 500) {
+        lastVoltageCheck = millis();
+        updatePowerStatus();  // Обновляем данные о питании
+        
+        // Регулируем яркость в зависимости от питания
+        esp_power_level_t currentPower = (esp_power_level_t)NimBLEDevice::getPower();
+        adjustBrightness(currentPower);
+    }
+    
+    // Проверка подключения
     if (millis() - lastCheck >= 500) {
         lastCheck = millis();
         bool realConnected = bleServer->getConnectedCount() > 0;
@@ -1350,208 +1410,65 @@ void loop() {
         }
     }
     
-    // Обновляем экран каждые 100мс
+    // Обновление экрана
     if (millis() - lastUpdate >= 100) {
         lastUpdate = millis();
         updateDisplay();
     }
     
-    // Убираем обновление экрана из режима сканирования
+    // Сканирование и проверка RSSI
     if (scanMode) {
-        static unsigned long lastResultsCheck = 0;
-        if (millis() - lastResultsCheck >= 200) {
-            lastResultsCheck = millis();
-            
-            // Сначала останавливаем
-            pScan->stop();
-            delay(10);  // Даем время на остановку
-            
-            // Получаем результаты
-            NimBLEScanResults results = NimBLEDevice::getScan()->getResults();
-            if (results.getCount() > 0) {
-                const NimBLEAdvertisedDevice* device = results.getDevice(0);
-                if (device && device->getAddress().toString() == connectedDeviceAddress) {
-                    lastAverageRssi = device->getRSSI();
-                    
-                    // Добавляем в массив для усреднения
-                    addRssiValue(lastAverageRssi);
-                    
-                    // Вычисляем и выводим среднее
-                    int avgRssi = getAverageRssi();
-                    
-                    updateDisplay();
-                }
-            }
-            
-            // Очищаем и перезапускаем
-            pScan->clearResults();
-            pScan->start(0, false);
-        }
-    }
-    
-    // Обработка кнопки A для теста
-    if (M5.BtnA.wasPressed() && M5.BtnB.wasPressed()) {  // Нажаты обе кнопки
-        if (connected) {
-            setPasswordFromSerial();  // Входим в режим настройки пароля
-        }
-    }
-    else if (M5.BtnA.wasPressed()) {
-        if (currentState == LOCKED) {
-            Serial.println("Manual unlock requested");
-            unlockComputer();
-        }
-    }
-    else if (M5.BtnB.wasPressed()) {
-        if (connected && currentState == NORMAL) {
-            Serial.println("Manual lock requested");
-            lockComputer();
-            currentState = LOCKED;
-        }
-    }
-    
-    // Проверяем статус подключения
-    if (bleServer && bleServer->getConnectedCount() > 0) {
-        if (!connection_info.connected) {
-            // Получаем информацию о подключении
-            ble_gap_conn_desc desc;
-            if (ble_gap_conn_find(0, &desc) == 0) {
-                connection_info.connected = true;
-                connection_info.conn_handle = desc.conn_handle;
-                connection_info.address = NimBLEAddress(desc.peer_ota_addr).toString();
-                
-                connectedDeviceAddress = connection_info.address;
-            }
-        }
-    } else {
-        connection_info.connected = false;
-        connection_info.conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        connection_info.address = "";
-    }
-    
-    // Добавляем отладочную информацию каждые 10 секунд
-    if (millis() - lastDebugCheck >= 10000) {
-        lastDebugCheck = millis();
-        if (connected && serialOutputEnabled) {
-            Serial.printf("\nStatus: %s, RSSI: %d\n", 
-                currentState == LOCKED ? "LOCKED" : "NORMAL",
-                lastAverageRssi);
-        }
-    }
-    
-    // Проверяем статус сканирования каждые 5 секунд
-    static unsigned long lastScanCheck = 0;
-    if (scanMode && millis() - lastScanCheck >= 5000) {
-        lastScanCheck = millis();
+        static unsigned long lastRssiCheck = 0;
+        static unsigned long lastRssiPrint = 0;
         
-        NimBLEScan* pScan = NimBLEDevice::getScan();
-        if (!pScan->isScanning()) {
-            if (serialOutputEnabled) {  // Добавим проверку
-                Serial.println("Scan stopped, restarting...");
-            }
-            pScan->setActiveScan(true);
-            pScan->setInterval(0x50);
-            pScan->setWindow(0x30);
+        if (millis() - lastRssiCheck >= 200) {
+            lastRssiCheck = millis();
             
-            if(pScan->start(0)) {
-                if (serialOutputEnabled) {  // Добавим проверку
-                    Serial.println("Scan restarted successfully");
-                }
-            } else {
-                if (serialOutputEnabled) {  // Добавим проверку
-                    Serial.println("Failed to restart scan!");
+            if (connected && bleServer && bleServer->getConnectedCount() > 0) {
+                NimBLEConnInfo connInfo = bleServer->getPeerInfo(0);
+                int8_t rssi;
+                if (ble_gap_conn_rssi(connInfo.getConnHandle(), &rssi) == 0) {
+                    if (rssi != 0 && rssi != 127) {
+                        // Создаем измерение
+                        RssiMeasurement measurement = {
+                            .value = rssi,
+                            .timestamp = millis(),
+                            .isValid = true
+                        };
+                        addRssiMeasurement(measurement);
+                        
+                        // Выводим в Serial реже
+                        if (serialOutputEnabled && millis() - lastRssiPrint >= 1000) {
+                            lastRssiPrint = millis();
+                            Serial.printf("\nRSSI: %d dBm (avg: %d)\n", rssi, lastAverageRssi);
+                        }
+                    }
                 }
             }
         }
     }
     
-    // В loop() добавляем обработку состояний
+    // Обработка Serial
+    echoSerialInput();
+    
+    delay(1);
+    
     if (scanMode) {
-        static unsigned long lastResultsCheck = 0;
-        if (millis() - lastResultsCheck >= 200) {
-            lastResultsCheck = millis();
+        static unsigned long lastRssiCheck = 0;
+        if (millis() - lastRssiCheck >= 200) {
+            lastRssiCheck = millis();
             
-            int avgRssi = getAverageRssi();
-            adjustTransmitPower(currentState, avgRssi);  // Добавляем здесь
-            
-            // Отображаем статус на экране
-            Disbuff->setCursor(5, 85);
-            if (avgRssi > RSSI_NEAR_THRESHOLD) {
-                Disbuff->setTextColor(GREEN);
-                Disbuff->print("NEAR PC");
-            } else if (avgRssi > RSSI_LOCK_THRESHOLD) {
-                Disbuff->setTextColor(YELLOW);
-                Disbuff->print("WARNING");
-            } else {
-                Disbuff->setTextColor(RED);
-                Disbuff->print("FAR");
-            }
-            
-            // Проверяем необходимость блокировки
-            if (shouldLockComputer(avgRssi)) {
-                Serial.printf("\n!!! DISTANCE THRESHOLD REACHED !!!\n");
-                Serial.printf("Average RSSI: %d (Threshold: %d)\n", 
-                    avgRssi, RSSI_LOCK_THRESHOLD);
-                Serial.println("Sending lock command...");
-                
+            // После обновления RSSI проверяем необходимость блокировки
+            if (lastAverageRssi < RSSI_LOCK_THRESHOLD && currentState != LOCKED) {
+                if (serialOutputEnabled) {
+                    Serial.printf("Signal below threshold (%d < %d), locking...\n", 
+                        lastAverageRssi, RSSI_LOCK_THRESHOLD);
+                }
                 lockComputer();
                 currentState = LOCKED;
             }
         }
     }
-    
-    // Проверяем состояние блокировки
-    if (currentState == LOCKED) {
-        static unsigned long lastCheck = 0;
-        const unsigned long CHECK_INTERVAL = 1000; // Проверяем раз в секунду
-        
-        if (millis() - lastCheck < CHECK_INTERVAL) {
-            return;  // Выходим если прошло мало времени
-        }
-        lastCheck = millis();
-        
-        if (getAverageRssi() > RSSI_NEAR_THRESHOLD) {
-            // Проверяем, прошло ли достаточно времени с последней попытки
-            if (millis() - lastUnlockAttempt >= UNLOCK_ATTEMPT_INTERVAL) {
-                lastUnlockAttempt = millis();
-                
-                // Проверяем наличие пароля перед попыткой разблокировки
-                if (getPasswordForDevice(connectedDeviceAddress.c_str()).length() > 0) {
-                    Serial.println("Device is near, attempting to unlock...");
-                    unlockComputer();
-                } else {
-                    Serial.println("Cannot unlock: no password stored. Use 'setpwd' command to set password.");
-                    // Показываем сообщение на экране
-                    Disbuff->fillSprite(BLACK);
-                    Disbuff->setTextColor(RED);
-                    Disbuff->setCursor(5, 40);
-                    Disbuff->print("NO PWD!");
-                    Disbuff->pushSprite(0, 0);
-                    delay(1000);
-                }
-            }
-        }
-    }
-    
-    // Обновляем состояние питания каждые 100мс
-    if (millis() - lastVoltageCheck >= 100) {
-        lastVoltageCheck = millis();
-        updatePowerStatus();
-        
-        // Используем isUSBConnected() для определения состояния USB
-        bool usbConnected = isUSBConnected();
-        
-        // Регулируем яркость в зависимости от состояния USB и режима
-        if (currentState == LOCKED && !usbConnected) {
-            M5.Display.setBrightness(BRIGHTNESS_MIN);
-        } else {
-            // ... существующая логика яркости ...
-        }
-    }
-    
-    // Заменяем checkSerialCommands() на echoSerialInput()
-    echoSerialInput();
-    
-    delay(1);
 }
 
 void lockComputer() {
@@ -1742,4 +1659,108 @@ void clearAllPreferences() {
     nvs_erase_all(nvsHandle);
     nvs_commit(nvsHandle);
     Serial.println("All preferences cleared");
-} 
+}
+
+// Добавляем функции для работы с RSSI
+RssiMeasurement getMeasuredRssi() {
+    RssiMeasurement measurement = {0, millis(), false};
+    
+    if (serialOutputEnabled) {
+        Serial.println("\n=== RSSI Measurement Start ===");
+    }
+    
+    // Метод 1: Через активное сканирование
+    if (pScan) {
+        if (serialOutputEnabled) Serial.println("Trying scan method...");
+        NimBLEScanResults results = pScan->getResults();
+        if (serialOutputEnabled) Serial.printf("Found devices: %d\n", results.getCount());
+        
+        for (int i = 0; i < results.getCount(); i++) {
+            const NimBLEAdvertisedDevice* device = results.getDevice(i);
+            if (device->getAddress().toString() == connectedDeviceAddress) {
+                int rssi = device->getRSSI();
+                if (serialOutputEnabled) {
+                    Serial.printf("Device found, RSSI: %d\n", rssi);
+                }
+                if (rssi != 0 && rssi < 0) {
+                    measurement.value = rssi;
+                    measurement.isValid = true;
+                    if (serialOutputEnabled) {
+                        Serial.println("✓ Valid RSSI from scan");
+                    }
+                    return measurement;
+                }
+            }
+        }
+        if (serialOutputEnabled) Serial.println("✗ Scan method failed");
+    }
+
+    // Метод 2: Через колбэк сервера
+    if (serialOutputEnabled) Serial.printf("Trying callback method, last RSSI: %d\n", lastAverageRssi);
+    if (lastAverageRssi != 0 && lastAverageRssi < 0) {
+        measurement.value = lastAverageRssi;
+        measurement.isValid = true;
+        if (serialOutputEnabled) {
+            Serial.println("✓ Valid RSSI from callback");
+        }
+        return measurement;
+    }
+    if (serialOutputEnabled) Serial.println("✗ Callback method failed");
+
+    // Метод 3: Через подключенное устройство
+    if (bleServer && bleServer->getConnectedCount() > 0) {
+        if (serialOutputEnabled) Serial.println("Trying client method...");
+        NimBLEClient* pClient = NimBLEDevice::createClient();
+        if (pClient) {
+            int rssi = pClient->getRssi();
+            if (serialOutputEnabled) {
+                Serial.printf("Client RSSI: %d\n", rssi);
+            }
+            if (rssi != 0 && rssi < 0) {
+                measurement.value = rssi;
+                measurement.isValid = true;
+                if (serialOutputEnabled) {
+                    Serial.println("✓ Valid RSSI from client");
+                }
+            }
+            NimBLEDevice::deleteClient(pClient);
+            if (measurement.isValid) {
+                return measurement;
+            }
+        }
+        if (serialOutputEnabled) Serial.println("✗ Client method failed");
+    }
+
+    if (serialOutputEnabled) {
+        Serial.println("✗ No valid RSSI measurement obtained");
+        Serial.println("=== RSSI Measurement End ===\n");
+    }
+    return measurement;
+}
+
+void addRssiMeasurement(const RssiMeasurement& measurement) {
+    if (!measurement.isValid) return;
+    
+    rssiHistory[rssiHistoryIndex] = measurement;
+    rssiHistoryIndex = (rssiHistoryIndex + 1) % RSSI_HISTORY_SIZE;
+    
+    // Обновляем среднее значение
+    int sum = 0;
+    int count = 0;
+    uint32_t currentTime = millis();
+    
+    for (int i = 0; i < RSSI_HISTORY_SIZE; i++) {
+        if (rssiHistory[i].isValid && 
+            (currentTime - rssiHistory[i].timestamp) < 5000) {
+            sum += rssiHistory[i].value;
+            count++;
+        }
+    }
+    
+    if (count > 0) {
+        lastAverageRssi = sum / count;
+        if (serialOutputEnabled) {
+            Serial.printf("Updated average RSSI: %d (from %d measurements)\n", lastAverageRssi, count);
+        }
+    }
+}
