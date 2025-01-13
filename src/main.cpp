@@ -950,8 +950,8 @@ static const uint8_t BRIGHTNESS_BATTERY = 30;  // Яркость от батар
 // Добавляем после других static переменных
 static float batteryVoltage = 0;
 static float batteryLevel = 0;
-static const float VOLTAGE_THRESHOLD = -15.0;     // Допустимое падение напряжения
-static const float DISCONNECT_THRESHOLD = -25.0;   // Порог для определения отключения
+static const float VOLTAGE_THRESHOLD = -0.15;     // Допустимое падение напряжения
+static const float DISCONNECT_THRESHOLD = -0.25;   // Порог для определения отключения
 static const int VOLTAGE_HISTORY_SIZE = 10;
 static float voltageHistory[VOLTAGE_HISTORY_SIZE] = {0};
 static int historyIndex = 0;
@@ -1018,16 +1018,19 @@ bool isUSBConnected() {
         maxAverageVoltage = avgVoltage;
     }
     
+    // Ключевой момент - мы следили за падением напряжения
     float voltageDrop = avgVoltage - maxAverageVoltage;
     
+    // При работе от USB напряжение стабильно высокое
+    // При отключении USB происходит резкое падение
     if (wasConnected) {
-        if (voltageDrop < DISCONNECT_THRESHOLD) {
+        if (voltageDrop < DISCONNECT_THRESHOLD) {  // Большое падение - отключили USB
             wasConnected = false;
             return false;
         }
         return true;
     } else {
-        if (voltageDrop > VOLTAGE_THRESHOLD) {
+        if (voltageDrop > VOLTAGE_THRESHOLD) {  // Напряжение выросло - подключили USB
             wasConnected = true;
             return true;
         }
@@ -1452,23 +1455,6 @@ void loop() {
     echoSerialInput();
     
     delay(1);
-    
-    if (scanMode) {
-        static unsigned long lastRssiCheck = 0;
-        if (millis() - lastRssiCheck >= 200) {
-            lastRssiCheck = millis();
-            
-            // После обновления RSSI проверяем необходимость блокировки
-            if (lastAverageRssi < RSSI_LOCK_THRESHOLD && currentState != LOCKED) {
-                if (serialOutputEnabled) {
-                    Serial.printf("Signal below threshold (%d < %d), locking...\n", 
-                        lastAverageRssi, RSSI_LOCK_THRESHOLD);
-                }
-                lockComputer();
-                currentState = LOCKED;
-            }
-        }
-    }
 }
 
 void lockComputer() {
