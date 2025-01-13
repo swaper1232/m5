@@ -125,6 +125,8 @@ struct DeviceSettings {
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings);
 DeviceSettings getDeviceSettings(const String& deviceAddress);
 void addRssiMeasurement(const RssiMeasurement& measurement);
+float calculateAverageVoltage();  // Добавляем прототип
+bool isUSBConnected();           // Добавляем прототип
 
 // Определения функций
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings) {
@@ -273,7 +275,7 @@ void updateDisplay() {
         // RSSI (20px)
         Disbuff->setTextColor(WHITE);
         Disbuff->setCursor(5, 20);
-        Disbuff->printf("RS:%d", lastAverageRssi);
+        Disbuff->printf("RS:%d", lastReceivedRssi);
         
         // Среднее RSSI (35px)
         Disbuff->setCursor(5, 35);
@@ -950,8 +952,8 @@ static const uint8_t BRIGHTNESS_BATTERY = 30;  // Яркость от батар
 // Добавляем после других static переменных
 static float batteryVoltage = 0;
 static float batteryLevel = 0;
-static const float VOLTAGE_THRESHOLD = -0.15;     // Допустимое падение напряжения
-static const float DISCONNECT_THRESHOLD = -0.25;   // Порог для определения отключения
+static const float VOLTAGE_THRESHOLD = -15.0;     // Допустимое падение напряжения
+static const float DISCONNECT_THRESHOLD = -25.0;   // Порог для определения отключения
 static const int VOLTAGE_HISTORY_SIZE = 10;
 static float voltageHistory[VOLTAGE_HISTORY_SIZE] = {0};
 static int historyIndex = 0;
@@ -961,6 +963,7 @@ static bool wasConnected = true;
 
 // После других static переменных
 static String currentShortKey = "";
+static int samplesBelow = 0;  // Счетчик для блокировки по RSSI
 
 // Функция обновления состояния питания
 void updatePowerStatus() {
@@ -973,29 +976,39 @@ void updatePowerStatus() {
     historyIndex = (historyIndex + 1) % VOLTAGE_HISTORY_SIZE;
     if (historyIndex == 0) historyFilled = true;
     
-    static bool wasUSB = true;
-    bool isUSB = M5.Power.isCharging();
-    
-    // Добавим защиту от частых изменений
-    static unsigned long lastChange = 0;
-    if (millis() - lastChange < 1000) {  // Минимум 1 секунда между изменениями
-        return;
+    // Отладочный вывод для напряжения
+    static unsigned long lastDebugTime = 0;
+    if (millis() - lastDebugTime >= 5000) {  // Каждые 5 секунд
+        lastDebugTime = millis();
+        if (serialOutputEnabled) {
+            Serial.printf("\n=== Power Status ===\n");
+            Serial.printf("Battery Voltage: %.2fV\n", batteryVoltage);
+            Serial.printf("Battery Level: %.0f%%\n", batteryLevel);
+            Serial.printf("Average Voltage: %.2fV\n", calculateAverageVoltage());
+            Serial.printf("Max Average Voltage: %.2fV\n", maxAverageVoltage);
+            Serial.printf("Voltage Drop: %.2fV\n", calculateAverageVoltage() - maxAverageVoltage);
+            Serial.printf("USB Connected: %s\n", isUSBConnected() ? "YES" : "NO");
+            Serial.printf("Current Brightness: %d\n", M5.Display.getBrightness());
+            Serial.println("==================\n");
+        }
     }
+
+    // Проверяем USB и меняем яркость
+    bool isUSB = isUSBConnected();
+    static bool wasUSB = true;
     
     if (wasUSB != isUSB) {
-        lastChange = millis();
         wasUSB = isUSB;
-        
-        // Устанавливаем яркость с задержкой
-        delay(10);
-        M5.Display.setBrightness(isUSB ? BRIGHTNESS_USB : BRIGHTNESS_BATTERY);
-        delay(10);
+        uint8_t newBrightness = isUSB ? BRIGHTNESS_USB : BRIGHTNESS_BATTERY;
         
         if (serialOutputEnabled) {
-            Serial.printf("Power source changed: %s, brightness: %d\n",
+            Serial.printf("Power source changed: %s -> %s, setting brightness: %d\n",
+                wasUSB ? "USB" : "Battery",
                 isUSB ? "USB" : "Battery",
-                isUSB ? BRIGHTNESS_USB : BRIGHTNESS_BATTERY);
+                newBrightness);
         }
+        
+        M5.Display.setBrightness(newBrightness);
     }
 }
 
@@ -1018,11 +1031,8 @@ bool isUSBConnected() {
         maxAverageVoltage = avgVoltage;
     }
     
-    // Ключевой момент - мы следили за падением напряжения
     float voltageDrop = avgVoltage - maxAverageVoltage;
     
-    // При работе от USB напряжение стабильно высокое
-    // При отключении USB происходит резкое падение
     if (wasConnected) {
         if (voltageDrop < DISCONNECT_THRESHOLD) {  // Большое падение - отключили USB
             wasConnected = false;
@@ -1455,6 +1465,36 @@ void loop() {
     echoSerialInput();
     
     delay(1);
+    
+    if (scanMode && connected) {
+        static unsigned long lastRssiCheck = 0;
+        if (millis() - lastRssiCheck >= 200) {  // Проверяем каждые 200мс
+            lastRssiCheck = millis();
+            
+            // Проверяем необходимость блокировки
+            if (currentState != LOCKED) {  // Если еще не заблокировано
+                if (lastAverageRssi < RSSI_LOCK_THRESHOLD) {
+                    samplesBelow++;
+                    
+                    if (serialOutputEnabled) {
+                        Serial.printf("\nSignal below threshold: %d/%d (RSSI: %d, Threshold: %d)\n",
+                            samplesBelow, SAMPLES_TO_CONFIRM, lastAverageRssi, RSSI_LOCK_THRESHOLD);
+                    }
+                    
+                    if (samplesBelow >= SAMPLES_TO_CONFIRM) {
+                        if (serialOutputEnabled) {
+                            Serial.println("!!! LOCKING COMPUTER !!!");
+                        }
+                        lockComputer();
+                        currentState = LOCKED;
+                        samplesBelow = 0;
+                    }
+                } else {
+                    samplesBelow = 0;  // Сбрасываем счетчик если сигнал стал лучше
+                }
+            }
+        }
+    }
 }
 
 void lockComputer() {
@@ -1727,6 +1767,9 @@ RssiMeasurement getMeasuredRssi() {
 void addRssiMeasurement(const RssiMeasurement& measurement) {
     if (!measurement.isValid) return;
     
+    // Обновляем текущее значение RSSI
+    lastReceivedRssi = measurement.value;
+    
     rssiHistory[rssiHistoryIndex] = measurement;
     rssiHistoryIndex = (rssiHistoryIndex + 1) % RSSI_HISTORY_SIZE;
     
@@ -1745,8 +1788,11 @@ void addRssiMeasurement(const RssiMeasurement& measurement) {
     
     if (count > 0) {
         lastAverageRssi = sum / count;
-        if (serialOutputEnabled) {
-            Serial.printf("Updated average RSSI: %d (from %d measurements)\n", lastAverageRssi, count);
+        // Отладка RSSI только каждые 5 секунд
+        static unsigned long lastRssiDebug = 0;
+        if (serialOutputEnabled && millis() - lastRssiDebug >= 5000) {
+            lastRssiDebug = millis();
+            Serial.printf("\nRSSI: %d dBm (avg: %d)\n", measurement.value, lastAverageRssi);
         }
     }
 }
