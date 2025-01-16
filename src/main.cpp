@@ -7,7 +7,7 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 
-// Добавляем эти строки сразу после включений
+// !!!! Добавляем эти строки сразу после включений
 #define RSSI_HISTORY_SIZE 10
 
 struct RssiMeasurement {
