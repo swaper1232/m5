@@ -1,0 +1,13 @@
+---
+description: документация по программированию модуля
+globs: @https://github.com/h2zero/NimBLE-Arduino/blob/master/docs/New_user_guide.md  @https://h2zero.github.io/NimBLE-Arduino/  @https://github.com/h2zero/NimBLE-Arduino/blob/master/docs/Usage_tips.md  @https://github.com/h2zero/NimBLE-Arduino/blob/master/docs/1.x_to2.x_migration_guide.md 
+---
+
+# Your rule content
+
+- You can @ files here
+- You can use markdown but dont have to
+@https://github.com/h2zero/NimBLE-Arduino/blob/master/docs/New_user_guide.md 
+@https://h2zero.github.io/NimBLE-Arduino/ 
+@https://github.com/h2zero/NimBLE-Arduino/blob/master/docs/Usage_tips.md 
+@https://github.com/h2zero/NimBLE-Arduino/blob/master/docs/1.x_to2.x_migration_guide.md 

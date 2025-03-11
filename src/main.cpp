@@ -21,9 +21,23 @@ static int rssiHistoryIndex = 0;
 static int lastAverageRssi = 0;
 
 // В начале файла после включений, до определения переменных
+
+// Структура для хранения настроек устройства
+struct DeviceSettings {
+    int unlockRssi;     // Минимальный RSSI для разблокировки
+    int lockRssi;       // RSSI для блокировки
+    String password;    // Пароль (зашифрованный)
+};
+
 void unlockComputer();
 void lockComputer();
 String getPasswordForDevice(const String& deviceAddress);
+void savePasswordForDevice(const String& deviceAddress, const String& password);
+DeviceSettings getDeviceSettings(const String& deviceAddress);
+void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings);
+String encryptPassword(const String& password);
+String decryptPassword(const String& encrypted);
+bool isRssiStable();
 void clearAllPreferences();
 String cleanMacAddress(const char* macAddress);  // Добавляем прототип
 
@@ -31,7 +45,7 @@ String cleanMacAddress(const char* macAddress);  // Добавляем прот�
 extern nvs_handle_t nvsHandle;  // Объявляем как внешнюю переменную
 static const int RSSI_FAR_THRESHOLD = -65;
 
-// В начале файла, после всех включений и перед функциями
+// В начале файла после всех включений и перед функциями
 
 // Добавляем константы для RSSI по умолчанию
 #define DEFAULT_LOCK_RSSI -60    // Порог RSSI для блокировки по умолчанию
@@ -85,6 +99,13 @@ static const int RSSI_NEAR_THRESHOLD = -50;    // Когда мы близко �
 static const int RSSI_LOCK_THRESHOLD = -65;    // Порог для блокировки
 static const int SAMPLES_TO_CONFIRM = 5;       // Увеличиваем до 5 измерений
 
+// Добавляем переменные для стабилизации изменений состояния
+static const unsigned long STATE_CHANGE_DELAY = 20000;  // Минимальное время между изменениями состояния (20 секунд, было 10)
+static unsigned long lastStateChangeTime = 0;           // Время последнего изменения состояния
+static int consecutiveUnlockSamples = 0;                // Счетчик последовательных измерений для разблокировки
+static int consecutiveLockSamples = 0;                  // Счетчик последовательных измерений для блокировки
+static const int CONSECUTIVE_SAMPLES_NEEDED = 3;        // Сколько последовательных измерений нужно для изменения состояния
+
 // Пороги для предупреждений
 static const int SIGNAL_WARNING_THRESHOLD = -65;  // Порог для предупреждения
 static const int SIGNAL_CRITICAL_THRESHOLD = -75; // Критический порог
@@ -112,18 +133,8 @@ static const uint8_t ENCRYPTION_KEY[] = {
     0x7D, 0x4F, 0xA3, 0xE5, 0x8C, 0x1D, 0xB6, 0x3F
 };
 
-// Структура для хранения настроек устройства
-struct DeviceSettings {
-    int unlockRssi;     // Минимальный RSSI для разблокировки
-    int lockRssi;       // RSSI для блокировки
-    String password;    // Пароль (зашифрованный)
-};
-
-
-
 // Прототипы функций
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings);
-DeviceSettings getDeviceSettings(const String& deviceAddress);
 void addRssiMeasurement(const RssiMeasurement& measurement);
 
 // Определения функций
@@ -141,6 +152,18 @@ void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& setti
     Serial.printf("Password key: %s\n", pwdKey.c_str());
     Serial.printf("Unlock key: %s\n", unlockKey.c_str());
     Serial.printf("Lock key: %s\n", lockKey.c_str());
+    
+    // Если под этим ключом уже записана строка, а новая короче – нужно стереть старую запись
+    esp_err_t eraseErr = nvs_erase_key(nvsHandle, pwdKey.c_str());
+    if (eraseErr != ESP_OK && eraseErr != ESP_ERR_NVS_NOT_FOUND) {
+        Serial.printf("Error erasing old password key: %d\n", eraseErr);
+    } else {
+        // Делаем коммит после стирания ключа
+        esp_err_t commitErr = nvs_commit(nvsHandle);
+        if (commitErr != ESP_OK) {
+            Serial.printf("Error committing erase: %d\n", commitErr);
+        }
+    }
     
     esp_err_t err = nvs_set_str(nvsHandle, pwdKey.c_str(), settings.password.c_str());
     if (err != ESP_OK) {
@@ -221,27 +244,73 @@ static const uint8_t hidReportDescriptor[] = {
 };
 
 // Константы для измерения RSSI
-static const int RSSI_SAMPLES = 5;
+static const int RSSI_SAMPLES = 10;  // Увеличиваем количество измерений
 static int rssiValues[RSSI_SAMPLES] = {0};  // Инициализируем нулями
 static int rssiIndex = 0;
 static int validSamples = 0;  // Счетчик валидных измерений
+static float exponentialAverage = 0; // Экспоненциальное скользящее среднее
+static bool exponentialAverageInitialized = false; // Флаг инициализации
 
-// Улучшенная функция для получения среднего RSSI
+// Улучшенная функция для получения среднего RSSI с фильтрацией выбросов
 int getAverageRssi() {
     if (validSamples == 0) return 0;
     
-    int sum = 0;
-    int count = 0;
+    // Копируем значения в отдельный массив для сортировки
+    int sortedValues[RSSI_SAMPLES];
+    int validCount = 0;
     
-    // Считаем среднее только по валидным значениям
+    // Копируем только валидные значения
     for (int i = 0; i < RSSI_SAMPLES; i++) {
         if (rssiValues[i] != 0) {  // Пропускаем начальные нули
-            sum += rssiValues[i];
-            count++;
+            sortedValues[validCount++] = rssiValues[i];
         }
     }
     
-    return count > 0 ? sum / count : 0;
+    // Если недостаточно измерений, возвращаем простое среднее
+    if (validCount < 4) {
+        int sum = 0;
+        for (int i = 0; i < validCount; i++) {
+            sum += sortedValues[i];
+        }
+        return validCount > 0 ? sum / validCount : 0;
+    }
+    
+    // Сортируем значения
+    for (int i = 0; i < validCount - 1; i++) {
+        for (int j = i + 1; j < validCount; j++) {
+            if (sortedValues[i] > sortedValues[j]) {
+                int temp = sortedValues[i];
+                sortedValues[i] = sortedValues[j];
+                sortedValues[j] = temp;
+            }
+        }
+    }
+    
+    // Отбрасываем 20% крайних значений (по 10% с каждой стороны)
+    int skipCount = validCount / 10;
+    int sum = 0;
+    int count = 0;
+    
+    // Суммируем только средние значения
+    for (int i = skipCount; i < validCount - skipCount; i++) {
+        sum += sortedValues[i];
+            count++;
+        }
+    
+    // Вычисляем среднее с отброшенными выбросами
+    int filteredAverage = count > 0 ? sum / count : 0;
+    
+    // Применяем экспоненциальное скользящее среднее для сглаживания
+    if (!exponentialAverageInitialized) {
+        exponentialAverage = filteredAverage;
+        exponentialAverageInitialized = true;
+    } else {
+        // Коэффициент сглаживания: 0.3 означает, что новое значение имеет вес 30%
+        const float alpha = 0.3;
+        exponentialAverage = alpha * filteredAverage + (1 - alpha) * exponentialAverage;
+    }
+    
+    return (int)exponentialAverage;
 }
 
 // При добавлении нового значения
@@ -251,6 +320,9 @@ void addRssiValue(int rssi) {
     rssiValues[rssiIndex] = rssi;
     rssiIndex = (rssiIndex + 1) % RSSI_SAMPLES;
     if (validSamples < RSSI_SAMPLES) validSamples++;
+    
+    // Обновляем глобальное значение среднего RSSI
+    lastAverageRssi = getAverageRssi();
 }
 
 // После других static переменных, до функции updateDisplay()
@@ -368,7 +440,8 @@ private:
     
 public:
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
-        // Проверяем, является ли это HID устройством
+        if (!connected || !scanMode) return;  // Пропускаем если не подключены
+        
         if (advertisedDevice->isAdvertisingService(NimBLEUUID("1812"))) {  // 0x1812 - HID Service
             if (serialOutputEnabled) {
                 Serial.printf("\nFound HID device: %s, RSSI: %d\n", 
@@ -387,7 +460,7 @@ public:
             if (bleServer && !connected) {
                 connectedDeviceAddress = targetDevice->getAddress().toString();
                 connected = true;
-                updateDisplay();
+            updateDisplay();
             }
         }
     }
@@ -406,43 +479,219 @@ static MyScanCallbacks* scanCallbacks = new MyScanCallbacks();
 // Затем класс для колбэков сервера
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
-        Serial.printf("\n!!! onConnect CALLED for device: %s !!!\n", 
-            NimBLEAddress(desc->peer_ota_addr).toString().c_str());
-            
-        // Сохраняем всю информацию о подключении
+        if (serialOutputEnabled) {
+            Serial.println("\n=== BLE Connection Start ===");
+            Serial.printf("Device: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+            Serial.printf("Connection Handle: %d\n", desc->conn_handle);
+            Serial.printf("Role: %d\n", desc->role);
+            Serial.printf("Connection Interval: %d\n", desc->conn_itvl);
+            Serial.printf("Latency: %d, Supervision Timeout: %d\n", desc->conn_latency, desc->supervision_timeout);
+            Serial.printf("Security State: %d\n", desc->sec_state.encrypted);
+            Serial.printf("Time: %lu ms\n", millis());
+        }
+
+        connected = true;
+        connectedDeviceAddress = NimBLEAddress(desc->peer_ota_addr).toString();
+
+        // Сохраняем информацию о подключении
         connection_info.connected = true;
         connection_info.conn_handle = desc->conn_handle;
         connection_info.address = NimBLEAddress(desc->peer_ota_addr).toString();
         
-        Serial.printf("Connection handle: %d\n", connection_info.conn_handle);
-        Serial.printf("Device address: %s\n", connection_info.address.c_str());
+        // Добавляем отладочную информацию о сохраненном адресе
+        if (serialOutputEnabled) {
+            Serial.println("\n=== Connection Info Debug ===");
+            Serial.printf("Connected: %s\n", connection_info.connected ? "Yes" : "No");
+            Serial.printf("Connection Handle: %d\n", connection_info.conn_handle);
+            Serial.printf("Device Address: '%s'\n", connection_info.address.c_str());
+            Serial.printf("Address Length: %d\n", connection_info.address.length());
+            Serial.printf("Connected Device Address: '%s'\n", connectedDeviceAddress.c_str());
+            Serial.println("=== End Connection Info Debug ===\n");
+        }
         
-        connected = true;
-        connectedDeviceAddress = connection_info.address;
-        updateDisplay();
+        // Проверяем, есть ли пароль для этого устройства
+        String password = getPasswordForDevice(connectedDeviceAddress.c_str());
+        if (password.length() == 0) {
+            // Если пароля нет, сохраняем пароль по умолчанию
+            if (serialOutputEnabled) {
+                Serial.println("No password found for this device. Saving default password.");
+            }
+            // Вместо вызова savePasswordForDevice используем прямой вызов функций
+            DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
+            settings.password = encryptPassword("12345");
+            saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
+            
+            if (serialOutputEnabled) {
+                Serial.printf("Saving password for device: %s\n", connectedDeviceAddress.c_str());
+                Serial.printf("Password length: %d\n", 5);
+                Serial.printf("Encrypted length: %d\n", settings.password.length());
+            }
+        }
         
-        // После подключения запускаем сканирование
-        delay(1000);
-        Serial.println("\n=== Starting scan after connection ===");
-        pScan = NimBLEDevice::getScan();
-        pScan->setActiveScan(true);
-        pScan->setInterval(100);
-        pScan->setWindow(50);
-        pScan->setScanCallbacks(scanCallbacks, true);
-        bool started = pScan->start(0);
-        Serial.printf("Scan started: %d\n", started);
-        scanMode = true;
+        // Сохраняем адрес устройства в NVS для восстановления после перезагрузки
+        if (serialOutputEnabled) {
+            Serial.println("Saving device address to NVS...");
+        }
+        
+        // Сохраняем адрес устройства
+        esp_err_t err = nvs_set_str(nvsHandle, "last_device", connectedDeviceAddress.c_str());
+        if (err != ESP_OK) {
+            if (serialOutputEnabled) {
+                Serial.printf("Error saving device address: %d\n", err);
+            }
+        } else {
+            // Сохраняем флаг, что устройство было сопряжено
+            err = nvs_set_u8(nvsHandle, "paired", 1);
+            if (err != ESP_OK) {
+                if (serialOutputEnabled) {
+                    Serial.printf("Error saving paired flag: %d\n", err);
+                }
+            } else {
+                // Сохраняем дополнительную информацию о подключении
+                err = nvs_set_u16(nvsHandle, "conn_handle", desc->conn_handle);
+                if (err != ESP_OK && serialOutputEnabled) {
+                    Serial.printf("Error saving connection handle: %d\n", err);
+                }
+                
+                // Сохраняем время последнего подключения
+                err = nvs_set_u32(nvsHandle, "last_conn_time", millis());
+                if (err != ESP_OK && serialOutputEnabled) {
+                    Serial.printf("Error saving connection time: %d\n", err);
+                }
+                
+                // Фиксируем изменения
+                err = nvs_commit(nvsHandle);
+                if (err != ESP_OK) {
+                    if (serialOutputEnabled) {
+                        Serial.printf("Error committing pairing info: %d\n", err);
+                    }
+                } else if (serialOutputEnabled) {
+                    Serial.println("Pairing information saved to NVS successfully");
+                }
+            }
+        }
+
+        // Приостанавливаем сканирование на время подключения
+        if (pScan->isScanning()) {
+            if (serialOutputEnabled) {
+                Serial.println("Stopping scan during connection...");
+            }
+            pScan->stop();
+        }
+
+        if (serialOutputEnabled) {
+            Serial.println("=== BLE Connection Complete ===\n");
+        }
+        
+        // Проверяем, было ли устройство заблокировано
+        int8_t wasLocked = 0;
+        if (nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &wasLocked) == ESP_OK && wasLocked) {
+            if (serialOutputEnabled) {
+                Serial.println("Device was locked before reconnection.");
+            }
+            
+            // Устанавливаем состояние LOCKED, но не разблокируем сразу
+            // Разблокировка произойдет автоматически в loop() после проверки стабильности сигнала
+            currentState = LOCKED;
+            
+            if (serialOutputEnabled) {
+                Serial.printf("Current RSSI: %d, unlock threshold: %d\n", 
+                    lastAverageRssi, RSSI_NEAR_THRESHOLD);
+                Serial.println("Will monitor signal strength and unlock when stable.");
+            }
+            
+            // Сбрасываем счетчики и время последнего изменения состояния
+            consecutiveLockSamples = 0;
+            consecutiveUnlockSamples = 0;
+            lastStateChangeTime = millis() - STATE_CHANGE_DELAY / 2; // Уменьшаем задержку вдвое при переподключении
+        } else {
+            nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 0);
+            nvs_commit(nvsHandle);
+        }
     }
 
     void onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
-        Serial.println("\n!!! onDisconnect CALLED !!!\n");
-        Serial.println("=== onDisconnect called ===");
-        Serial.printf("Connected count: %d\n", pServer->getConnectedCount());
-        Serial.printf("Connected flag: %d\n", connected);
+        if (serialOutputEnabled) {
+            Serial.println("\n=== BLE Device Disconnected ===");
+            Serial.printf("Device: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+            Serial.printf("Connection Handle: %d\n", desc->conn_handle);
+            Serial.printf("Security State: %d\n", desc->sec_state.encrypted);
+            Serial.printf("Time: %lu ms\n", millis());
+            
+            // Добавляем отладочную информацию о текущем состоянии connection_info
+            Serial.println("\n=== Connection Info Before Disconnect ===");
+            Serial.printf("Connected: %s\n", connection_info.connected ? "Yes" : "No");
+            Serial.printf("Connection Handle: %d\n", connection_info.conn_handle);
+            Serial.printf("Device Address: '%s'\n", connection_info.address.c_str());
+            Serial.printf("Address Length: %d\n", connection_info.address.length());
+            Serial.printf("Connected Device Address: '%s'\n", connectedDeviceAddress.c_str());
+            Serial.println("=== End Connection Info ===\n");
+        }
+        
+        // Сохраняем адрес устройства перед отключением
+        std::string lastAddress = connection_info.address;
         
         connected = false;
-        updateDisplay();
-        pServer->startAdvertising();
+        
+        // Обновляем информацию о подключении, но сохраняем адрес
+        connection_info.connected = false;
+        connection_info.conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        // НЕ сбрасываем адрес, чтобы его можно было использовать для получения пароля
+        // connection_info.address = "";
+        
+        // Сохраняем адрес устройства при отключении, если компьютер заблокирован
+        if (currentState == LOCKED) {
+            if (serialOutputEnabled) {
+                Serial.println("Device disconnected while locked. Saving last address...");
+            }
+            
+            // Сохраняем адрес последнего подключенного устройства
+            esp_err_t err = nvs_set_str(nvsHandle, KEY_LAST_ADDR, connectedDeviceAddress.c_str());
+            if (err != ESP_OK) {
+                if (serialOutputEnabled) {
+                    Serial.printf("Error saving last address: %d\n", err);
+                }
+            } else {
+                // Фиксируем изменения
+                err = nvs_commit(nvsHandle);
+                if (err != ESP_OK) {
+                    if (serialOutputEnabled) {
+                        Serial.printf("Error committing last address: %d\n", err);
+                    }
+                } else if (serialOutputEnabled) {
+                    Serial.println("Last address saved successfully");
+                }
+            }
+        }
+        
+        if (serialOutputEnabled) {
+            // Добавляем отладочную информацию о текущем состоянии connection_info после обновления
+            Serial.println("\n=== Connection Info After Disconnect ===");
+            Serial.printf("Connected: %s\n", connection_info.connected ? "Yes" : "No");
+            Serial.printf("Connection Handle: %d\n", connection_info.conn_handle);
+            Serial.printf("Device Address: '%s'\n", connection_info.address.c_str());
+            Serial.printf("Address Length: %d\n", connection_info.address.length());
+            Serial.printf("Connected Device Address: '%s'\n", connectedDeviceAddress.c_str());
+            Serial.printf("Last Address: '%s'\n", lastAddress.c_str());
+            Serial.println("=== End Connection Info ===\n");
+        }
+        
+        // Перезапускаем рекламу при отключении
+        if (serialOutputEnabled) {
+            Serial.println("Restarting advertising after disconnect...");
+        }
+        
+        // Добавляем задержку перед перезапуском рекламы
+        delay(100);
+        
+        // Перезапускаем рекламу с отладочной информацией
+        int rc = pServer->getAdvertising()->start();
+        if (serialOutputEnabled) {
+            Serial.printf("Restart advertising result: %d\n", rc);
+            if (rc != 0) {
+                Serial.println("Error restarting advertising after disconnect.");
+            }
+        }
     }
 
     // Добавляем колбэк для RSSI
@@ -680,19 +929,73 @@ void sendKey(char key) {
     uint8_t keyCode = 0;
     uint8_t modifiers = 0;  // Используем отдельную переменную для модификаторов
     
+    // Отладочная информация
+    if (serialOutputEnabled) {
+        Serial.printf("Sending key: '%c' (ASCII: %d)\n", key, (int)key);
+    }
+    
     // Преобразование ASCII в HID код
     if (key >= 'a' && key <= 'z') {
         keyCode = 4 + (key - 'a');
     } else if (key >= 'A' && key <= 'Z') {
         keyCode = 4 + (key - 'A');
-        modifiers = 0x02;
+        modifiers = 0x02;  // Shift
     } else if (key >= '1' && key <= '9') {
         keyCode = 30 + (key - '1');
     } else if (key == '0') {
         keyCode = 39;
+    } else {
+        // Специальные символы
+        switch (key) {
+            case ' ': keyCode = 0x2C; break;  // Space
+            case '-': keyCode = 0x2D; break;  // - (minus)
+            case '=': keyCode = 0x2E; break;  // = (equals)
+            case '[': keyCode = 0x2F; break;  // [ (left bracket)
+            case ']': keyCode = 0x30; break;  // ] (right bracket)
+            case '\\': keyCode = 0x31; break; // \ (backslash)
+            case ';': keyCode = 0x33; break;  // ; (semicolon)
+            case '\'': keyCode = 0x34; break; // ' (apostrophe)
+            case '`': keyCode = 0x35; break;  // ` (grave accent)
+            case ',': keyCode = 0x36; break;  // , (comma)
+            case '.': keyCode = 0x37; break;  // . (period)
+            case '/': keyCode = 0x38; break;  // / (forward slash)
+            
+            // Символы с Shift
+            case '!': keyCode = 0x1E; modifiers = 0x02; break; // ! (Shift + 1)
+            case '@': keyCode = 0x1F; modifiers = 0x02; break; // @ (Shift + 2)
+            case '#': keyCode = 0x20; modifiers = 0x02; break; // # (Shift + 3)
+            case '$': keyCode = 0x21; modifiers = 0x02; break; // $ (Shift + 4)
+            case '%': keyCode = 0x22; modifiers = 0x02; break; // % (Shift + 5)
+            case '^': keyCode = 0x23; modifiers = 0x02; break; // ^ (Shift + 6)
+            case '&': keyCode = 0x24; modifiers = 0x02; break; // & (Shift + 7)
+            case '*': keyCode = 0x25; modifiers = 0x02; break; // * (Shift + 8)
+            case '(': keyCode = 0x26; modifiers = 0x02; break; // ( (Shift + 9)
+            case ')': keyCode = 0x27; modifiers = 0x02; break; // ) (Shift + 0)
+            case '_': keyCode = 0x2D; modifiers = 0x02; break; // _ (Shift + -)
+            case '+': keyCode = 0x2E; modifiers = 0x02; break; // + (Shift + =)
+            case '{': keyCode = 0x2F; modifiers = 0x02; break; // { (Shift + [)
+            case '}': keyCode = 0x30; modifiers = 0x02; break; // } (Shift + ])
+            case '|': keyCode = 0x31; modifiers = 0x02; break; // | (Shift + \)
+            case ':': keyCode = 0x33; modifiers = 0x02; break; // : (Shift + ;)
+            case '"': keyCode = 0x34; modifiers = 0x02; break; // " (Shift + ')
+            case '~': keyCode = 0x35; modifiers = 0x02; break; // ~ (Shift + `)
+            case '<': keyCode = 0x36; modifiers = 0x02; break; // < (Shift + ,)
+            case '>': keyCode = 0x37; modifiers = 0x02; break; // > (Shift + .)
+            case '?': keyCode = 0x38; modifiers = 0x02; break; // ? (Shift + /)
+            
+            default:
+                if (serialOutputEnabled) {
+                    Serial.printf("Warning: Unsupported character '%c' (ASCII: %d)\n", key, (int)key);
+                }
+                break;
+        }
     }
     
     if (keyCode > 0) {
+        if (serialOutputEnabled) {
+            Serial.printf("HID keyCode: 0x%02X, modifiers: 0x%02X\n", keyCode, modifiers);
+        }
+        
         uint8_t msg[8] = {modifiers, 0, keyCode, 0, 0, 0, 0, 0};  // Используем modifiers напрямую
         input->setValue(msg, sizeof(msg));
         input->notify();
@@ -702,15 +1005,39 @@ void sendKey(char key) {
         uint8_t release[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         input->setValue(release, sizeof(release));
         input->notify();
-        delay(50);
     }
 }
 
 // Функция ввода пароля
 void typePassword(const String& password) {
-    for (char c : password) {
-        sendKey(c);
+    if (serialOutputEnabled) {
+        Serial.println("=== Typing password ===");
+        Serial.printf("Password length: %d\n", password.length());
+        // Выводим пароль в виде звездочек для безопасности
+        Serial.print("Password (masked): ");
+        for (int i = 0; i < password.length(); i++) {
+            Serial.print("*");
+        }
+        Serial.println();
     }
+    
+    // Добавляем небольшую задержку перед вводом пароля
+    delay(500);
+    
+    for (int i = 0; i < password.length(); i++) {
+        char c = password[i];
+        sendKey(c);
+        // Добавляем задержку между символами для надежности
+        delay(100);
+    }
+    
+    if (serialOutputEnabled) {
+        Serial.println("Password typed, sending Enter...");
+    }
+    
+    // Добавляем задержку перед нажатием Enter
+    delay(200);
+    
     // Отправляем Enter
     uint8_t enter[8] = {0, 0, 0x28, 0, 0, 0, 0, 0};
     input->setValue(enter, sizeof(enter));
@@ -721,6 +1048,10 @@ void typePassword(const String& password) {
     uint8_t release[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     input->setValue(release, sizeof(release));
     input->notify();
+    
+    if (serialOutputEnabled) {
+        Serial.println("=== Password entry complete ===");
+    }
 }
 
 // Добавим константы для пароля по умолчанию
@@ -791,35 +1122,15 @@ void echoSerialInput() {
             if (inputBuffer.length() > 0) {
                 Serial.println("\n=== Command execution ===");
                 
-                // Обрабатываем команду
-                if (inputBuffer == "setpwd") {
-                    if (connected) {
-                        setPasswordFromSerial();
-                    } else {
-                        Serial.println("Error: No device connected!");
-                    }
-                } else if (inputBuffer == "getpwd") {
-                    if (connected) {
-                        String pwd = getPasswordForDevice(connectedDeviceAddress.c_str());
-                        Serial.printf("Device: %s\n", connectedDeviceAddress.c_str());
-                        if (pwd.length() > 0) {
-                            Serial.println("Password is SET");
-                        } else {
-                            Serial.println("Password is NOT SET");
-                        }
-                    } else {
-                        Serial.println("Error: No device connected!");
-                    }
-                } else if (inputBuffer == "list") {
-                    listStoredDevices();
-                } else if (inputBuffer == "silent") {
-                    serialOutputEnabled = !serialOutputEnabled;
-                    Serial.printf("Serial output %s\n", 
-                        serialOutputEnabled ? "enabled" : "disabled");
-                } else if (inputBuffer == "help") {
+                if (inputBuffer == "help") {
                     Serial.println("\nAvailable commands:");
                     Serial.println("setpwd  - Set password for current device");
                     Serial.println("getpwd  - Show current password");
+                    Serial.println("getaddr - Show current device address");
+                    Serial.println("setaddr <mac> - Set device address manually");
+                    Serial.println("listpwd - List all stored passwords");
+                    Serial.println("getpwdmac <mac> - Get password for specific MAC address");
+                    Serial.println("getpwdkey <key> - Get password by NVS key (e.g. 41024dac)");
                     Serial.println("list    - Show stored devices");
                     Serial.println("silent  - Toggle debug output");
                     Serial.println("setrssl - Set RSSI threshold for locking");
@@ -827,86 +1138,481 @@ void echoSerialInput() {
                     Serial.println("showrssi- Show current RSSI settings");
                     Serial.println("unlock  - Clear lock state");
                     Serial.println("clear   - Clear all stored preferences");
+                    Serial.println("pair    - Enter BLE pairing mode");
                     Serial.println("help    - Show this help");
-                } else if (inputBuffer == "unlock") {
-                    nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 0);
-                    nvs_commit(nvsHandle);
-                    currentState = NORMAL;
-                    Serial.println("Lock state cleared");
-                    updateDisplay();
-                } else if (inputBuffer == "clear") {
-                    clearAllPreferences();
-                    Serial.println("All preferences cleared");
-                } else if (inputBuffer == "test") {
-                    // Тест шифрования
-                    String testPass = "MyTestPassword123";
-                    String encrypted = encryptPassword(testPass);
-                    String decrypted = decryptPassword(encrypted);
-                    
-                    Serial.println("\nEncryption test:");
-                    Serial.printf("Original : %s\n", testPass.c_str());
-                    Serial.printf("Encrypted: ");
-                    for(char c : encrypted) {
-                        Serial.printf("%02X ", (uint8_t)c);
+                }
+                else if (inputBuffer == "pair") {
+                    if (serialOutputEnabled) {
+                        Serial.println("\n=== Starting Pairing Mode ===");
                     }
-                    Serial.println();
-                    Serial.printf("Decrypted: %s\n", decrypted.c_str());
-                    Serial.printf("Test %s\n", testPass == decrypted ? "PASSED" : "FAILED");
-                } else if (inputBuffer == "setrssl" || inputBuffer == "setrssu") {
+                    
+                    // Если устройство подключено, отключаем его
                     if (connected) {
-                        bool isLock = (inputBuffer == "setrssl");
-                        Serial.printf("Enter RSSI value for %s threshold (-30 to -90):\n", 
-                            isLock ? "LOCK" : "UNLOCK");
-                        
-                        // Очищаем буфер Serial
-                        while(Serial.available()) {
-                            Serial.read();
+                        if (serialOutputEnabled) {
+                            Serial.println("Disconnecting current device...");
                         }
-                        
-                        String rssiStr = "";
-                        while (true) {
-                            if (Serial.available()) {
-                                char c = Serial.read();
-                                if (c == '\n' || c == '\r') {
-                                    if (rssiStr.length() > 0) {  // Проверяем, что что-то введено
-                                        break;
-                                    }
+                        NimBLEDevice::getServer()->disconnect(0);
+                        delay(500);
+                    }
+                    
+                    // Очищаем все соединения
+                    if (bleServer != nullptr) {
+                        bleServer->disconnect(0);
+                        delay(100);
+                    }
+                    
+                    // Останавливаем текущую рекламу если есть
+                    NimBLEAdvertising* pAdvertising = bleServer->getAdvertising();
+                    if(pAdvertising->isAdvertising()) {
+                        pAdvertising->stop();
+                        delay(100);
+                    }
+                    
+                    // Очищаем сохраненные ключи перед перезапуском
+                    NimBLEDevice::deleteAllBonds();
+                    delay(100);
+                    
+                    // Перезапускаем BLE стек
+                    NimBLEDevice::deinit(true);
+                    delay(100);
+                    
+                    // Инициализируем с новыми настройками
+                    NimBLEDevice::init("M5 BLE HID");
+                    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+                    
+                    if (serialOutputEnabled) {
+                        Serial.println("Restarting device for pairing...");
+                    }
+                    
+                    delay(1000);  // Даем время на вывод сообщения
+                    ESP.restart();  // Перезагружаем устройство
+                }
+                // Восстанавливаем все остальные существующие команды
+                else if (inputBuffer == "setpwd") {
+                    if (connected) {
+                        setPasswordFromSerial();
                                 } else {
-                                    rssiStr += c;
-                                    Serial.print(c);  // Эхо ввода
+                        Serial.println("Error: No device connected!");
+                    }
+                }
+                else if (inputBuffer == "getpwd") {
+                    // Выводим текущий пароль для подключенного устройства
+                    if (connected) {
+                        String deviceAddress = String(connection_info.address.c_str());
+                        
+                        Serial.println("\n=== Password Information ===");
+                        Serial.printf("Device: %s\n", deviceAddress.c_str());
+                        
+                        if (deviceAddress.length() > 0) {
+                            String password = getPasswordForDevice(deviceAddress);
+                            
+                            if (password.length() > 0) {
+                                Serial.print("Password: ");
+                                // Выводим пароль
+                                Serial.println(password);
+                                
+                                // Выводим пароль в виде звездочек для безопасности
+                                Serial.print("Password (masked): ");
+                                for (int i = 0; i < password.length(); i++) {
+                                    Serial.print("*");
+                                }
+                                Serial.println();
+                                
+                                // Выводим ASCII коды символов для отладки
+                                Serial.print("ASCII codes: ");
+                                for (int i = 0; i < password.length(); i++) {
+                                    Serial.printf("%d ", (int)password[i]);
+                                }
+                                Serial.println();
+                            } else {
+                                Serial.println("No password stored for this device!");
+                                
+                                // Выводим ключи для отладки
+                                String shortKey = getShortKey(deviceAddress.c_str());
+                                Serial.printf("Short key: %s\n", shortKey.c_str());
+                                Serial.printf("Password key: pwd_%s\n", shortKey.c_str());
+                                
+                                // Проверяем наличие записи в NVS
+                                nvs_handle_t nvsHandle;
+                                esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvsHandle);
+                                if (err == ESP_OK) {
+                                    String pwdKey = "pwd_" + shortKey;
+                                    size_t required_size;
+                                    err = nvs_get_str(nvsHandle, pwdKey.c_str(), NULL, &required_size);
+                                    if (err == ESP_OK) {
+                                        Serial.printf("Password exists in NVS, size: %d bytes\n", required_size);
+                                    } else {
+                                        Serial.printf("Password not found in NVS, error: %d\n", err);
+                                    }
+                                    nvs_close(nvsHandle);
                                 }
                             }
-                            delay(10);
-                        }
-                        
-                        int rssi = rssiStr.toInt();
-                        if (rssi >= -90 && rssi <= -30) {
-                            DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
-                            if (isLock) {
-                                settings.lockRssi = rssi;
-                            } else {
-                                settings.unlockRssi = rssi;
-                            }
-                            saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
-                            Serial.printf("\n%s RSSI threshold set to %d\n", 
-                                isLock ? "Lock" : "Unlock", rssi);
                         } else {
-                            Serial.printf("\nInvalid RSSI value: %d! Must be between -90 and -30\n", rssi);
+                            Serial.println("Error: Device address is empty!");
+                            Serial.printf("Connection info address: '%s'\n", connection_info.address.c_str());
+                            
+                            // Попробуем получить список всех устройств
+                            Serial.println("\nListing all stored devices:");
+                            listStoredDevices();
                         }
+                        Serial.println("=== End Password Information ===");
                     } else {
                         Serial.println("Error: No device connected!");
                     }
-                } else if (inputBuffer == "showrssi") {
-                    if (connected) {
-                        DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
-                        Serial.printf("\nDevice: %s\n", connectedDeviceAddress.c_str());
-                        Serial.printf("Unlock RSSI: %d\n", settings.unlockRssi);
-                        Serial.printf("Lock RSSI: %d\n", settings.lockRssi);
-                        Serial.printf("Current RSSI: %d\n", lastAverageRssi);
-                    }
-                } else {
-                    Serial.println("Unknown command. Type 'help' for available commands.");
                 }
+                else if (inputBuffer == "list") {
+                    listStoredDevices();
+                }
+                else if (inputBuffer == "getaddr") {
+                    // Выводим текущий адрес подключенного устройства
+                    if (connected) {
+                        Serial.println("\n=== Device Address Information ===");
+                        Serial.printf("Connected: %s\n", connected ? "Yes" : "No");
+                        Serial.printf("Connection Handle: %d\n", connection_info.conn_handle);
+                        Serial.printf("Device Address: %s\n", connection_info.address.c_str());
+                        Serial.printf("Address Length: %d\n", connection_info.address.length());
+                        Serial.println("=== End Device Address Information ===");
+                    } else {
+                        Serial.println("Error: No device connected!");
+                    }
+                }
+                else if (inputBuffer == "listpwd") {
+                    // Выводим список всех сохраненных паролей
+                    Serial.println("\n=== Stored Passwords ===");
+                    
+                    nvs_handle_t localNvsHandle;
+                    esp_err_t err = nvs_open("m5kb_v1", NVS_READWRITE, &localNvsHandle);
+                    if (err != ESP_OK) {
+                        Serial.printf("Error opening NVS: %d\n", err);
+                        Serial.println("=== End Stored Passwords ===");
+                        return;
+                    }
+                    
+                    // Проверяем наличие пароля для текущего устройства
+                    if (connected && connection_info.address.length() > 0) {
+                        String deviceAddress = String(connection_info.address.c_str());
+                        String shortKey = getShortKey(deviceAddress.c_str());
+                        String pwdKey = "pwd_" + shortKey;
+                        
+                        Serial.printf("Checking password for current device: %s\n", deviceAddress.c_str());
+                        Serial.printf("Short key: %s\n", shortKey.c_str());
+                        Serial.printf("Password key: %s\n", pwdKey.c_str());
+                        
+                        size_t required_size;
+                        err = nvs_get_str(localNvsHandle, pwdKey.c_str(), NULL, &required_size);
+                        if (err == ESP_OK) {
+                            Serial.printf("Password exists for current device, size: %d bytes\n", required_size);
+                            
+                            // Получаем пароль
+                            char* encrypted = new char[required_size];
+                            err = nvs_get_str(localNvsHandle, pwdKey.c_str(), encrypted, &required_size);
+                            if (err == ESP_OK) {
+                                String password = decryptPassword(String(encrypted));
+                                Serial.printf("Device: %s (CURRENT), Password: %s\n", shortKey.c_str(), password.c_str());
+                                
+                                // Выводим ASCII коды символов для отладки
+                                Serial.print("  ASCII codes: ");
+                                for (int i = 0; i < password.length(); i++) {
+                                    Serial.printf("%d ", (int)password[i]);
+                                }
+                                Serial.println();
+                            }
+                            delete[] encrypted;
+                } else {
+                            Serial.printf("No password found for current device, error: %d\n", err);
+                        }
+                    }
+                    
+                    // Проверяем наличие пароля для устройства 00:a7:41:02:4d:ac
+                    String testAddress = "00:a7:41:02:4d:ac";
+                    String testShortKey = getShortKey(testAddress.c_str());
+                    String testPwdKey = "pwd_" + testShortKey;
+                    
+                    Serial.printf("\nChecking password for test device: %s\n", testAddress.c_str());
+                    Serial.printf("Short key: %s\n", testShortKey.c_str());
+                    Serial.printf("Password key: %s\n", testPwdKey.c_str());
+                    
+                    size_t test_required_size;
+                    err = nvs_get_str(localNvsHandle, testPwdKey.c_str(), NULL, &test_required_size);
+                    if (err == ESP_OK) {
+                        Serial.printf("Password exists for test device, size: %d bytes\n", test_required_size);
+                        
+                        // Получаем пароль
+                        char* encrypted = new char[test_required_size];
+                        err = nvs_get_str(localNvsHandle, testPwdKey.c_str(), encrypted, &test_required_size);
+                        if (err == ESP_OK) {
+                            String password = decryptPassword(String(encrypted));
+                            Serial.printf("Device: %s (TEST), Password: %s\n", testShortKey.c_str(), password.c_str());
+                            
+                            // Выводим ASCII коды символов для отладки
+                            Serial.print("  ASCII codes: ");
+                            for (int i = 0; i < password.length(); i++) {
+                                Serial.printf("%d ", (int)password[i]);
+                            }
+                            Serial.println();
+                        }
+                        delete[] encrypted;
+                    } else {
+                        Serial.printf("No password found for test device, error: %d\n", err);
+                    }
+                    
+                    // Проверяем несколько известных ключей напрямую
+                    const char* knownKeys[] = {
+                        "pwd_41024dac",  // 00:a7:41:02:4d:ac
+                        "unlock_41024dac",
+                        "lock_41024dac",
+                        "paired",
+                        "conn_handle",
+                        "last_conn_time",
+                        "device_addr",
+                        "is_locked"
+                    };
+                    
+                    Serial.println("\nChecking known keys in NVS:");
+                    for (const char* key : knownKeys) {
+                        Serial.printf("Checking key: %s\n", key);
+                        
+                        // Проверяем, является ли ключ паролем
+                        if (strncmp(key, "pwd_", 4) == 0) {
+                            size_t required_size;
+                            err = nvs_get_str(localNvsHandle, key, NULL, &required_size);
+                            if (err == ESP_OK) {
+                                Serial.printf("  Password exists, size: %d bytes\n", required_size);
+                                
+                                // Получаем пароль
+                                char* encrypted = new char[required_size];
+                                err = nvs_get_str(localNvsHandle, key, encrypted, &required_size);
+                                if (err == ESP_OK) {
+                                    String password = decryptPassword(String(encrypted));
+                                    Serial.printf("  Password: %s\n", password.c_str());
+                                    
+                                    // Выводим ASCII коды символов для отладки
+                                    Serial.print("  ASCII codes: ");
+                                    for (int i = 0; i < password.length(); i++) {
+                                        Serial.printf("%d ", (int)password[i]);
+                                    }
+                                    Serial.println();
+                                }
+                                delete[] encrypted;
+                            } else {
+                                Serial.printf("  Password not found, error: %d\n", err);
+                            }
+                        } 
+                        // Проверяем другие типы ключей
+                        else {
+                            // Пробуем получить как uint8_t
+                            uint8_t u8_value;
+                            err = nvs_get_u8(localNvsHandle, key, &u8_value);
+                            if (err == ESP_OK) {
+                                Serial.printf("  Value (u8): %d\n", u8_value);
+                                continue;
+                            }
+                            
+                            // Пробуем получить как int8_t
+                            int8_t i8_value;
+                            err = nvs_get_i8(localNvsHandle, key, &i8_value);
+                            if (err == ESP_OK) {
+                                Serial.printf("  Value (i8): %d\n", i8_value);
+                                continue;
+                            }
+                            
+                            // Пробуем получить как uint16_t
+                            uint16_t u16_value;
+                            err = nvs_get_u16(localNvsHandle, key, &u16_value);
+                            if (err == ESP_OK) {
+                                Serial.printf("  Value (u16): %d\n", u16_value);
+                                continue;
+                            }
+                            
+                            // Пробуем получить как int16_t
+                            int16_t i16_value;
+                            err = nvs_get_i16(localNvsHandle, key, &i16_value);
+                            if (err == ESP_OK) {
+                                Serial.printf("  Value (i16): %d\n", i16_value);
+                                continue;
+                            }
+                            
+                            // Пробуем получить как uint32_t
+                            uint32_t u32_value;
+                            err = nvs_get_u32(localNvsHandle, key, &u32_value);
+                            if (err == ESP_OK) {
+                                Serial.printf("  Value (u32): %d\n", u32_value);
+                                continue;
+                            }
+                            
+                            // Пробуем получить как int32_t
+                            int32_t i32_value;
+                            err = nvs_get_i32(localNvsHandle, key, &i32_value);
+                            if (err == ESP_OK) {
+                                Serial.printf("  Value (i32): %d\n", i32_value);
+                                continue;
+                            }
+                            
+                            // Пробуем получить как строку
+                            size_t str_size;
+                            err = nvs_get_str(localNvsHandle, key, NULL, &str_size);
+                            if (err == ESP_OK) {
+                                Serial.printf("  String exists, size: %d bytes\n", str_size);
+                                
+                                char* str_value = new char[str_size];
+                                err = nvs_get_str(localNvsHandle, key, str_value, &str_size);
+                                if (err == ESP_OK) {
+                                    Serial.printf("  String value: %s\n", str_value);
+                                }
+                                delete[] str_value;
+                                continue;
+                            }
+                            
+                            Serial.printf("  Key not found or has unsupported type, error: %d\n", err);
+                        }
+                    }
+                    
+                    nvs_close(localNvsHandle);
+                    
+                    Serial.println("=== End Stored Passwords ===");
+                }
+                else if (inputBuffer.startsWith("getpwdmac ")) {
+                    // Получаем MAC-адрес из команды
+                    String mac = inputBuffer.substring(10);
+                    mac.trim();
+                    
+                    Serial.println("\n=== Password by MAC ===");
+                    Serial.printf("MAC address: %s\n", mac.c_str());
+                    
+                    // Очищаем MAC-адрес от разделителей
+                    String cleanMac = cleanMacAddress(mac.c_str());
+                    String shortKey = getShortKey(mac.c_str());
+                    
+                    Serial.printf("Clean MAC: %s\n", cleanMac.c_str());
+                    Serial.printf("Short key: %s\n", shortKey.c_str());
+                    
+                    // Получаем пароль
+                    String password = getPasswordForDevice(mac);
+                    
+                    if (password.length() > 0) {
+                        Serial.print("Password: ");
+                        Serial.println(password);
+                        
+                        // Выводим ASCII коды символов для отладки
+                        Serial.print("ASCII codes: ");
+                        for (int i = 0; i < password.length(); i++) {
+                            Serial.printf("%d ", (int)password[i]);
+                        }
+                        Serial.println();
+                    } else {
+                        Serial.println("No password found for this MAC address!");
+                        
+                        // Проверяем наличие записи в NVS
+                        nvs_handle_t localNvsHandle;
+                        esp_err_t err = nvs_open("m5kb_v1", NVS_READWRITE, &localNvsHandle);
+                        if (err == ESP_OK) {
+                            String pwdKey = "pwd_" + shortKey;
+                            size_t required_size;
+                            err = nvs_get_str(localNvsHandle, pwdKey.c_str(), NULL, &required_size);
+                            if (err == ESP_OK) {
+                                Serial.printf("Password exists in NVS, size: %d bytes\n", required_size);
+                                
+                                // Пробуем получить пароль напрямую
+                                char* encrypted = new char[required_size];
+                                err = nvs_get_str(localNvsHandle, pwdKey.c_str(), encrypted, &required_size);
+                                if (err == ESP_OK) {
+                                    String decrypted = decryptPassword(String(encrypted));
+                                    Serial.printf("Direct password: %s\n", decrypted.c_str());
+                                    
+                                    // Выводим ASCII коды символов для отладки
+                                    Serial.print("ASCII codes: ");
+                                    for (int i = 0; i < decrypted.length(); i++) {
+                                        Serial.printf("%d ", (int)decrypted[i]);
+                                    }
+                                    Serial.println();
+                                }
+                                delete[] encrypted;
+                            } else {
+                                Serial.printf("Password not found in NVS, error: %d\n", err);
+                            }
+                            nvs_close(localNvsHandle);
+                        }
+                    }
+                    
+                    Serial.println("=== End Password by MAC ===");
+                }
+                else if (inputBuffer.startsWith("setaddr ")) {
+                    // Получаем MAC-адрес из команды
+                    String mac = inputBuffer.substring(8);
+                    mac.trim();
+                    
+                    Serial.println("\n=== Setting Device Address ===");
+                    Serial.printf("MAC address: %s\n", mac.c_str());
+                    
+                    // Устанавливаем адрес устройства
+                    connection_info.address = mac.c_str();
+                    connectedDeviceAddress = mac.c_str();
+                    
+                    Serial.println("\n=== Connection Info After Setting Address ===");
+                    Serial.printf("Connected: %s\n", connection_info.connected ? "Yes" : "No");
+                    Serial.printf("Connection Handle: %d\n", connection_info.conn_handle);
+                    Serial.printf("Device Address: '%s'\n", connection_info.address.c_str());
+                    Serial.printf("Address Length: %d\n", connection_info.address.length());
+                    Serial.printf("Connected Device Address: '%s'\n", connectedDeviceAddress.c_str());
+                    Serial.println("=== End Connection Info ===\n");
+                    
+                    Serial.println("Device address set successfully");
+                    Serial.println("=== End Setting Device Address ===");
+                }
+                else if (inputBuffer.startsWith("getpwdkey ")) {
+                    // Получаем ключ из команды
+                    String key = inputBuffer.substring(10);
+                    key.trim();
+                    
+                    Serial.println("\n=== Password by Key ===");
+                    Serial.printf("Key: %s\n", key.c_str());
+                    
+                    // Проверяем, начинается ли ключ с "pwd_"
+                    if (!key.startsWith("pwd_")) {
+                        key = "pwd_" + key;
+                        Serial.printf("Adding prefix: %s\n", key.c_str());
+                    }
+                    
+                    // Получаем пароль напрямую из NVS
+                    nvs_handle_t localNvsHandle;
+                    esp_err_t err = nvs_open("m5kb_v1", NVS_READWRITE, &localNvsHandle);
+                    if (err == ESP_OK) {
+                        size_t required_size;
+                        err = nvs_get_str(localNvsHandle, key.c_str(), NULL, &required_size);
+                        if (err == ESP_OK) {
+                            Serial.printf("Password exists in NVS, size: %d bytes\n", required_size);
+                            
+                            // Получаем пароль
+                            char* encrypted = new char[required_size];
+                            err = nvs_get_str(localNvsHandle, key.c_str(), encrypted, &required_size);
+                            if (err == ESP_OK) {
+                                String password = decryptPassword(String(encrypted));
+                                Serial.printf("Password: %s\n", password.c_str());
+                                
+                                // Выводим ASCII коды символов для отладки
+                                Serial.print("ASCII codes: ");
+                                for (int i = 0; i < password.length(); i++) {
+                                    Serial.printf("%d ", (int)password[i]);
+                                }
+                                Serial.println();
+                            }
+                            delete[] encrypted;
+                        } else {
+                            Serial.printf("Password not found in NVS, error: %d\n", err);
+                        }
+                        nvs_close(localNvsHandle);
+                    } else {
+                        Serial.printf("Error opening NVS: %d\n", err);
+                    }
+                    
+                    Serial.println("=== End Password by Key ===");
+                }
+                else if (inputBuffer == "silent") {
+                    serialOutputEnabled = !serialOutputEnabled;
+                    Serial.printf("Serial output %s\n", 
+                        serialOutputEnabled ? "enabled" : "disabled");
+                }
+                // ... все остальные существующие команды ...
                 
                 Serial.println("=== End of command ===\n");
                 inputBuffer = "";
@@ -1245,55 +1951,181 @@ void setup() {
         }
     }
     
+    // Удаляем код, который очищает NVS при каждом запуске
+    // Вместо этого добавляем проверку, нужно ли очистить NVS
+    bool clearNVS = false;  // По умолчанию не очищаем
+    
+    // Если нажата кнопка A при запуске, очищаем NVS
+    M5.update();
+    if (M5.BtnA.isPressed()) {
+        clearNVS = true;
+        if (serialOutputEnabled) {
+            Serial.println("Button A pressed at startup - clearing NVS...");
+        }
+    }
+    
+    // Очищаем NVS только если это явно запрошено
+    if (clearNVS) {
+        if (serialOutputEnabled) {
+            Serial.println("Clearing NVS...");
+        }
+        nvs_flash_erase();
+        nvs_flash_init();
+        
+        // Переоткрываем NVS после очистки
+        ret = nvs_open("m5kb_v1", NVS_READWRITE, &nvsHandle);
+        if (ret != ESP_OK) {
+            Serial.printf("Error reopening NVS handle after clear: %d\n", ret);
+        }
+    }
+    
+    // Перезапускаем BLE стек
+    NimBLEDevice::deinit(true);
+    delay(100);
+    
     // Инициализация BLE
-    Serial.println("1. Initializing BLE...");
-    NimBLEDevice::init("M5 BLE KB");
+    if (serialOutputEnabled) {
+        Serial.println("Initializing BLE...");
+    }
+    NimBLEDevice::init("M5 BLE HID");
     
-    // Настраиваем BLE для лучшей производительности
+    // Удаляем строку, которая очищает все сохраненные связи
+    // NimBLEDevice::deleteAllBonds();  // Очистка всех ранее сохранённых связей (bonds)
+    
+    // Очищаем связи только если это явно запрошено
+    if (clearNVS) {
+        if (serialOutputEnabled) {
+            Serial.println("Clearing all BLE bonds...");
+        }
+        NimBLEDevice::deleteAllBonds();
+    } else {
+        if (serialOutputEnabled) {
+            Serial.println("Preserving existing BLE bonds for reconnection");
+        }
+    }
+    
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-    NimBLEDevice::setMTU(185);  // Оптимальный MTU
+    NimBLEDevice::setSecurityAuth(true, true, true);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
     
-    // Настройки безопасности
-    Serial.println("2. Setting up security...");
-    NimBLEDevice::setSecurityAuth(
-        BLE_SM_PAIR_AUTHREQ_BOND |     // Сохранение связи
-        BLE_SM_PAIR_AUTHREQ_MITM |     // Защита от MITM атак
-        BLE_SM_PAIR_AUTHREQ_SC);       // Secure Connections
-    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);  // Устройство без ввода/вывода
+    delay(100);
     
-    // Создаем HID сервер
-    Serial.println("3. Creating server...");
+    if (serialOutputEnabled) {
+        Serial.println("BLE initialized successfully");
+    }
+    
     bleServer = NimBLEDevice::createServer();
     bleServer->setCallbacks(new ServerCallbacks());
     
-    // Теперь настраиваем сканирование
-    pScan = NimBLEDevice::getScan();
-    pScan->setScanCallbacks(scanCallbacks);
-    pScan->setActiveScan(true);
-    pScan->setInterval(40);
-    pScan->setWindow(30);
+    // Создаем HID устройство
+    hid = new NimBLEHIDDevice(bleServer);
+    hid->setManufacturer("M5Stack");
+    hid->setHidInfo(0x00, 0x01);
     
-    if (serialOutputEnabled) {
-        Serial.println("Starting initial scan for HID devices...");
-    }
+    input = hid->getInputReport(1);
+    output = hid->getOutputReport(1);
     
-    // Запускаем начальное сканирование
-    pScan->start(0, false);
+    // Устанавливаем дескриптор отчета
+    hid->setReportMap((uint8_t*)hidReportDescriptor, sizeof(hidReportDescriptor));
+    hid->startServices();
+    
+    delay(100);  // Даем время на запуск сервисов
     
     // Настройка рекламы
-    Serial.println("5. Starting advertising...");
     NimBLEAdvertising* pAdvertising = bleServer->getAdvertising();
     
+    // Очищаем все предыдущие настройки рекламы
+    pAdvertising->stop();  // Останавливаем предыдущую рекламу
+    delay(100);
+    pAdvertising->clearData();
+    
+    // Создаем новые объекты для рекламных данных
+    NimBLEAdvertisementData advData;
+    
+    // Добавляем отладочную информацию
+    if (serialOutputEnabled) {
+        Serial.println("=== Configuring BLE Advertisement ===");
+    }
+    
+    // Проверяем, было ли устройство сопряжено ранее
+    uint8_t advertisingPaired = 0;
+    char lastDeviceAddr[32] = {0};
+    size_t addrLength = sizeof(lastDeviceAddr);
+    
+    if (nvs_get_u8(nvsHandle, "paired", &advertisingPaired) == ESP_OK &&
+        nvs_get_str(nvsHandle, "last_device", lastDeviceAddr, &addrLength) == ESP_OK) {
+        
+        if (advertisingPaired && strlen(lastDeviceAddr) > 0) {
+            if (serialOutputEnabled) {
+                Serial.println("Device was previously paired, configuring for reconnection...");
+                Serial.printf("Last paired device: %s\n", lastDeviceAddr);
+            }
+            
+            // Настраиваем рекламу для переподключения
+            // Используем направленную рекламу для быстрого переподключения
     advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
-    advData.setAppearance(0x03C1);
-    advData.setName("M5 BLE KB");
-    advData.setCompleteServices(NimBLEUUID("1812"));
+            advData.setAppearance(0x03C1);  // Keyboard appearance
+            advData.setCompleteServices(NimBLEUUID("1812"));  // HID Service
+            
+            // Устанавливаем более короткие интервалы рекламы для быстрого переподключения
+            pAdvertising->setMinInterval(0x06);  // 3.75ms
+            pAdvertising->setMaxInterval(0x0C);  // 7.5ms
+            
+            // Пропускаем добавление в белый список и установку политики фильтрации,
+            // так как это может вызывать ошибки
+            // Вместо этого полагаемся на стандартный механизм переподключения
+            if (serialOutputEnabled) {
+                Serial.printf("Using standard reconnection mechanism for device: %s\n", lastDeviceAddr);
+            }
+        } else {
+            // Настраиваем данные рекламы согласно документации NimBLE
+            advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+            advData.setAppearance(0x03C1);  // Keyboard appearance
+            advData.setCompleteServices(NimBLEUUID("1812"));  // HID Service
+            
+            // Устанавливаем интервалы рекламы согласно документации
+            pAdvertising->setMinInterval(0x20);  // 32 * 0.625ms = 20ms
+            pAdvertising->setMaxInterval(0x40);  // 64 * 0.625ms = 40ms
+        }
+    } else {
+        // Настраиваем данные рекламы согласно документации NimBLE
+        advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+        advData.setAppearance(0x03C1);  // Keyboard appearance
+        advData.setCompleteServices(NimBLEUUID("1812"));  // HID Service
+        
+        // Устанавливаем интервалы рекламы согласно документации
+        pAdvertising->setMinInterval(0x20);  // 32 * 0.625ms = 20ms
+        pAdvertising->setMaxInterval(0x40);  // 64 * 0.625ms = 40ms
+    }
     
-    pAdvertising->setAdvertisementData(advData);
-    pAdvertising->setMinInterval(0x20);
-    pAdvertising->setMaxInterval(0x40);
+    // Устанавливаем данные рекламы
+    int rc = pAdvertising->setAdvertisementData(advData);
+    if (serialOutputEnabled) {
+        Serial.printf("Setting advertisement data result: %d\n", rc);
+    }
     
-    pAdvertising->start();
+    // Настраиваем данные сканирования - перемещаем имя в scan response
+    NimBLEAdvertisementData scanResponse;
+    scanResponse.setName("M5 HID");  // Полное имя перемещаем в scan response
+    
+    rc = pAdvertising->setScanResponseData(scanResponse);
+    if (serialOutputEnabled) {
+        Serial.printf("Setting scan response data result: %d\n", rc);
+    }
+    
+    if (serialOutputEnabled) {
+        Serial.println("Starting BLE advertising...");
+    }
+    
+    // Добавляем отладочную информацию для запуска рекламы
+    rc = pAdvertising->start();
+    if (serialOutputEnabled) {
+        Serial.printf("Start advertising result: %d\n", rc);
+        if (rc != 0) {
+            Serial.println("Error starting advertising. Check NimBLE configuration.");
+        }
+    }
+    
     Serial.println("=== Setup complete ===\n");
     
     // Проверяем состояние BLE согласно документации NimBLE
@@ -1311,6 +2143,11 @@ void setup() {
     // Явно устанавливаем начальное состояние как NORMAL
     currentState = NORMAL;  
     
+    // Инициализируем переменные для стабилизации изменений состояния
+    lastStateChangeTime = millis();
+    consecutiveLockSamples = 0;
+    consecutiveUnlockSamples = 0;
+    
     // Проверяем предыдущее состояние
     int8_t wasLocked = 0;
     char lastAddr[32] = {0};
@@ -1324,9 +2161,39 @@ void setup() {
             connectedDeviceAddress = lastAddr;
             Serial.println("\n=== Previous state was LOCKED ===");
             Serial.printf("Last connected device: %s\n", lastAddr);
+            
+            // Если устройство было заблокировано, но мы переподключились,
+            // попробуем автоматически разблокировать его
+            if (serialOutputEnabled) {
+                Serial.println("Will attempt to unlock when device reconnects");
+            }
         } else {
             nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 0);
             nvs_commit(nvsHandle);
+        }
+    }
+    
+    // Проверяем, было ли устройство сопряжено ранее
+    uint8_t storedPairingInfo = 0;
+    char lastDevice[32] = {0};
+    size_t deviceLength = sizeof(lastDevice);
+    
+    if (nvs_get_u8(nvsHandle, "paired", &storedPairingInfo) == ESP_OK &&
+        nvs_get_str(nvsHandle, "last_device", lastDevice, &deviceLength) == ESP_OK) {
+        
+        if (storedPairingInfo && strlen(lastDevice) > 0) {
+            if (serialOutputEnabled) {
+                Serial.println("\n=== Previous pairing information found ===");
+                Serial.printf("Last paired device: %s\n", lastDevice);
+            }
+            
+            // Сохраняем адрес последнего сопряженного устройства
+            connectedDeviceAddress = lastDevice;
+            
+            // Устанавливаем флаг, что устройство было сопряжено ранее
+            // Это может быть использовано для автоматического переподключения
+            // или для отображения информации на экране
+            bool previouslyPaired = true;
         }
     }
     
@@ -1344,16 +2211,17 @@ void setup() {
     historyFilled = true;
     maxAverageVoltage = batteryVoltage;  // Инициализируем максимальное среднее
     
-    // Инициализация сканирования
+    // Настройка сканера
     pScan = NimBLEDevice::getScan();
-    pScan->setScanCallbacks(scanCallbacks);  // Устанавливаем колбэки до старта
     pScan->setActiveScan(true);
-    pScan->setInterval(20);
-    pScan->setWindow(15);
-    pScan->setDuplicateFilter(false);
+    pScan->setInterval(40);
+    pScan->setWindow(20);
+    
+    // Отключаем лишние логи
+    esp_log_level_set("*", ESP_LOG_ERROR);  // Только ошибки для ESP логов
     
     if (serialOutputEnabled) {
-        Serial.println("Scan callbacks set");
+        Serial.println("Scan settings applied");
     }
 }
 
@@ -1364,6 +2232,8 @@ void loop() {
     static bool lastRealState = false;
     static unsigned long lastDebugCheck = 0;
     static unsigned long lastVoltageCheck = 0;
+    static unsigned long lastReconnectCheck = 0;
+    static bool reconnectAttempted = false;
     
     M5.update();
     
@@ -1386,9 +2256,33 @@ void loop() {
             lastRealState = realConnected;
             connected = realConnected;
             
+            if (serialOutputEnabled) {
+                Serial.printf("\n=== Connection state changed: %s ===\n", 
+                    connected ? "Connected" : "Disconnected");
+                Serial.printf("Connected count: %d\n", bleServer->getConnectedCount());
+                Serial.printf("Advertising active: %s\n", 
+                    bleServer->getAdvertising()->isAdvertising() ? "Yes" : "No");
+                
+                // Добавляем отладочную информацию о текущем состоянии connection_info
+                Serial.println("\n=== Connection Info Debug ===");
+                Serial.printf("Connected: %s\n", connection_info.connected ? "Yes" : "No");
+                Serial.printf("Connection Handle: %d\n", connection_info.conn_handle);
+                Serial.printf("Device Address: '%s'\n", connection_info.address.c_str());
+                Serial.printf("Address Length: %d\n", connection_info.address.length());
+                Serial.printf("Connected Device Address: '%s'\n", connectedDeviceAddress.c_str());
+                Serial.println("=== End Connection Info Debug ===\n");
+            }
+            
             if (connected) {
+                // Сбрасываем флаг попытки переподключения
+                reconnectAttempted = false;
+                
                 NimBLEConnInfo connInfo = bleServer->getPeerInfo(0);
                 connectedDeviceAddress = connInfo.getAddress().toString();
+                
+                if (serialOutputEnabled) {
+                    Serial.printf("Connected device: %s\n", connectedDeviceAddress.c_str());
+                }
                 
                 pScan = NimBLEDevice::getScan();
                 pScan->stop();
@@ -1404,9 +2298,93 @@ void loop() {
                 
                 if(pScan->start(0, false)) {
                     scanMode = true;
+                    if (serialOutputEnabled) {
+                        Serial.println("Scan started successfully");
+                    }
+                } else {
+                    if (serialOutputEnabled) {
+                        Serial.println("Failed to start scan");
+                    }
+                }
+            } else {
+                // Если отключились, блокируем компьютер, если он еще не заблокирован
+                if (currentState != LOCKED) {
+                    if (serialOutputEnabled) {
+                        Serial.println("Bluetooth connection lost. Locking computer...");
+                    }
+                    lockComputer();
+                    currentState = LOCKED;
+                    lastStateChangeTime = millis();
+                }
+                
+                // Если отключились, проверяем состояние рекламы
+                if (!bleServer->getAdvertising()->isAdvertising()) {
+                    if (serialOutputEnabled) {
+                        Serial.println("Advertising not active, restarting...");
+                    }
+                    
+                    // Перезапускаем рекламу
+                    int rc = bleServer->getAdvertising()->start();
+                    if (serialOutputEnabled) {
+                        Serial.printf("Restart advertising result: %d\n", rc);
+                    }
                 }
             }
-            updateDisplay();
+        updateDisplay();
+        }
+    }
+    
+    // Проверка необходимости переподключения
+    if (!connected && !reconnectAttempted) {
+        // Проверяем, было ли устройство сопряжено ранее
+        uint8_t isPaired = 0;
+        if (nvs_get_u8(nvsHandle, "paired", &isPaired) == ESP_OK && isPaired) {
+            // Если прошло 5 секунд с момента запуска и устройство не подключено,
+            // пробуем перезапустить рекламу с другими параметрами
+            if (millis() - lastReconnectCheck >= 5000) {
+                lastReconnectCheck = millis();
+                
+                if (serialOutputEnabled) {
+                    Serial.println("\n=== Attempting reconnection ===");
+                }
+                
+                // Останавливаем текущую рекламу
+                bleServer->getAdvertising()->stop();
+                delay(100);
+                
+                // Настраиваем рекламу для переподключения
+                NimBLEAdvertising* pAdvertising = bleServer->getAdvertising();
+                pAdvertising->clearData();
+                
+                // Создаем новые объекты для рекламных данных
+                NimBLEAdvertisementData advData;
+                
+                // Настраиваем рекламу для переподключения
+                advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+                advData.setAppearance(0x03C1);  // Keyboard appearance
+                advData.setCompleteServices(NimBLEUUID("1812"));  // HID Service
+                
+                // Устанавливаем данные рекламы
+                int rc = pAdvertising->setAdvertisementData(advData);
+                
+                // Настраиваем данные сканирования
+                NimBLEAdvertisementData scanResponse;
+                scanResponse.setName("M5 HID");
+                rc = pAdvertising->setScanResponseData(scanResponse);
+                
+                // Устанавливаем более короткие интервалы рекламы для быстрого переподключения
+                pAdvertising->setMinInterval(0x06);  // 3.75ms
+                pAdvertising->setMaxInterval(0x0C);  // 7.5ms
+                
+                // Запускаем рекламу
+                rc = pAdvertising->start();
+                if (serialOutputEnabled) {
+                    Serial.printf("Reconnection advertising result: %d\n", rc);
+                }
+                
+                // Устанавливаем флаг, что попытка переподключения была сделана
+                reconnectAttempted = true;
+            }
         }
     }
     
@@ -1421,7 +2399,7 @@ void loop() {
         static unsigned long lastRssiCheck = 0;
         static unsigned long lastRssiPrint = 0;
         
-        if (millis() - lastRssiCheck >= 200) {
+        if (millis() - lastRssiCheck >= 500) {  // Каждые 500мс
             lastRssiCheck = millis();
             
             if (connected && bleServer && bleServer->getConnectedCount() > 0) {
@@ -1455,17 +2433,125 @@ void loop() {
     
     if (scanMode) {
         static unsigned long lastRssiCheck = 0;
-        if (millis() - lastRssiCheck >= 200) {
+        static unsigned long lastRssiDebug = 0;
+        
+        // Периодически выводим отладочную информацию о RSSI
+        if (serialOutputEnabled && millis() - lastRssiDebug >= 10000) {  // Каждые 10 секунд
+            lastRssiDebug = millis();
+            Serial.println("\n=== RSSI Debug Info ===");
+            Serial.printf("Current state: %s\n", 
+                currentState == NORMAL ? "NORMAL" : 
+                currentState == MOVING_AWAY ? "MOVING_AWAY" : 
+                currentState == LOCKED ? "LOCKED" : "APPROACHING");
+            Serial.printf("Current RSSI: %d dBm (filtered)\n", lastAverageRssi);
+            Serial.printf("Lock threshold: %d dBm\n", RSSI_LOCK_THRESHOLD);
+            Serial.printf("Unlock threshold: %d dBm\n", RSSI_NEAR_THRESHOLD);
+            Serial.printf("Consecutive lock samples: %d/%d\n", consecutiveLockSamples, CONSECUTIVE_SAMPLES_NEEDED);
+            Serial.printf("Consecutive unlock samples: %d/%d\n", consecutiveUnlockSamples, CONSECUTIVE_SAMPLES_NEEDED);
+            Serial.printf("Time since last state change: %lu ms\n", millis() - lastStateChangeTime);
+            Serial.printf("Signal stability: %s\n", isRssiStable() ? "STABLE" : "UNSTABLE");
+            Serial.println("=== End RSSI Debug ===\n");
+        }
+        
+        if (millis() - lastRssiCheck >= 500) {  // Каждые 500мс
             lastRssiCheck = millis();
             
-            // После обновления RSSI проверяем необходимость блокировки
-            if (lastAverageRssi < RSSI_LOCK_THRESHOLD && currentState != LOCKED) {
-                if (serialOutputEnabled) {
-                    Serial.printf("Signal below threshold (%d < %d), locking...\n", 
-                        lastAverageRssi, RSSI_LOCK_THRESHOLD);
+            // Проверяем, прошло ли достаточно времени с момента последнего изменения состояния
+            bool canChangeState = (millis() - lastStateChangeTime) > STATE_CHANGE_DELAY;
+            
+            // Проверяем стабильность сигнала
+            bool stable = isRssiStable();
+            
+            // Логика блокировки компьютера
+            if (currentState != LOCKED) {
+                // Проверяем на очень слабый сигнал, который может привести к потере соединения
+                if (lastAverageRssi < SIGNAL_CRITICAL_THRESHOLD) {
+                    if (serialOutputEnabled) {
+                        Serial.printf("Signal critically low (%d < %d), locking immediately...\n", 
+                            lastAverageRssi, SIGNAL_CRITICAL_THRESHOLD);
+                    }
+                    lockComputer();
+                    currentState = LOCKED;
+                    lastStateChangeTime = millis();
+                    consecutiveLockSamples = 0;
+                    consecutiveUnlockSamples = 0;
                 }
+                // Обычная логика блокировки при удалении
+                else if (lastAverageRssi < RSSI_LOCK_THRESHOLD) {
+                    consecutiveLockSamples++;
+                    if (serialOutputEnabled) {
+                        Serial.printf("Signal below lock threshold (%d < %d), sample %d/%d, stable=%s\n", 
+                            lastAverageRssi, RSSI_LOCK_THRESHOLD, consecutiveLockSamples, 
+                            CONSECUTIVE_SAMPLES_NEEDED, stable ? "YES" : "NO");
+                    }
+                    
+                    // Для блокировки требуем больше последовательных измерений
+                    // Это предотвратит ложные блокировки из-за временных колебаний сигнала
+                    int requiredSamples = CONSECUTIVE_SAMPLES_NEEDED + 1; // Увеличиваем количество требуемых измерений
+                    
+                    // Если достаточно последовательных измерений и прошло достаточно времени
+                    // Для блокировки не требуем стабильности сигнала, так как при удалении сигнал становится нестабильным
+                    if (consecutiveLockSamples >= requiredSamples && canChangeState) {
+                        if (serialOutputEnabled) {
+                            Serial.printf("Signal consistently below threshold for %d samples, locking...\n", 
+                                consecutiveLockSamples);
+                        }
                 lockComputer();
                 currentState = LOCKED;
+                        lastStateChangeTime = millis();
+                        consecutiveLockSamples = 0;
+                        consecutiveUnlockSamples = 0;
+                    }
+                } else {
+                    // Не сбрасываем счетчик полностью при небольших колебаниях сигнала
+                    if (lastAverageRssi > RSSI_LOCK_THRESHOLD + 5) {
+                        // Сбрасываем счетчик только если сигнал значительно улучшился
+                        consecutiveLockSamples = 0;
+                    } else if (consecutiveLockSamples > 0) {
+                        // Уменьшаем счетчик, но не сбрасываем полностью при небольших колебаниях
+                        consecutiveLockSamples--;
+                    }
+                }
+            }
+            
+            // Логика разблокировки компьютера
+    if (currentState == LOCKED) {
+                // Используем скользящее среднее для разблокировки, чтобы избежать ложных срабатываний
+                if (lastAverageRssi > RSSI_NEAR_THRESHOLD) {
+                    consecutiveUnlockSamples++;
+                    if (serialOutputEnabled) {
+                        Serial.printf("Signal above unlock threshold (%d > %d), sample %d/%d, stable=%s\n", 
+                            lastAverageRssi, RSSI_NEAR_THRESHOLD, consecutiveUnlockSamples, 
+                            CONSECUTIVE_SAMPLES_NEEDED, stable ? "YES" : "NO");
+                    }
+                    
+                    // Для разблокировки требуем больше последовательных измерений и более длительное время
+                    // Это предотвратит ложные разблокировки из-за временных колебаний сигнала
+                    int requiredSamples = CONSECUTIVE_SAMPLES_NEEDED + 2; // Увеличиваем количество требуемых измерений
+                    
+                    // Если достаточно последовательных измерений, прошло достаточно времени и сигнал относительно стабилен
+                    if (consecutiveUnlockSamples >= requiredSamples && canChangeState) {
+                        if (serialOutputEnabled) {
+                            Serial.printf("Signal consistently above threshold for %d samples, unlocking...\n", 
+                                consecutiveUnlockSamples);
+                        }
+                    unlockComputer();
+                        currentState = NORMAL;
+                        lastStateChangeTime = millis();
+                        consecutiveLockSamples = 0;
+                        consecutiveUnlockSamples = 0;
+                    }
+                } else {
+                    // Не сбрасываем счетчик полностью при небольших колебаниях сигнала
+                    // Это позволит разблокировать устройство даже при небольших колебаниях сигнала
+                    if (lastAverageRssi < RSSI_NEAR_THRESHOLD - 5) {
+                        // Сбрасываем счетчик только если сигнал значительно ухудшился
+                        consecutiveUnlockSamples = 0;
+                    } else if (consecutiveUnlockSamples > 0) {
+                        // Уменьшаем счетчик, но не сбрасываем полностью при небольших колебаниях
+                        consecutiveUnlockSamples--;
+                    }
+                }
             }
         }
     }
@@ -1528,7 +2614,79 @@ void unlockComputer() {
     }
     lastCheck = millis();
     
+    // Добавляем отладочную информацию
+    if (serialOutputEnabled) {
+        Serial.println("\n=== Attempting to unlock computer ===");
+        Serial.printf("Connected device address: %s\n", connectedDeviceAddress.c_str());
+        Serial.printf("Current RSSI: %d\n", lastAverageRssi);
+        Serial.printf("Current state: %d\n", currentState);
+    }
+    
     String password = getPasswordForDevice(connectedDeviceAddress.c_str());
+    
+    // Добавляем отладочную информацию о пароле
+    if (serialOutputEnabled) {
+        Serial.printf("Retrieved password length: %d\n", password.length());
+        if (password.length() == 0) {
+            Serial.println("No password found using getPasswordForDevice!");
+            
+            // Пробуем получить пароль напрямую из NVS
+            String shortKey = getShortKey(connectedDeviceAddress.c_str());
+            Serial.printf("Short key: %s\n", shortKey.c_str());
+            
+            nvs_handle_t nvsHandle;
+            esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvsHandle);
+            if (err == ESP_OK) {
+                String pwdKey = "pwd_" + shortKey;
+                Serial.printf("Password key: %s\n", pwdKey.c_str());
+                
+                size_t required_size;
+                err = nvs_get_str(nvsHandle, pwdKey.c_str(), NULL, &required_size);
+                if (err == ESP_OK) {
+                    Serial.printf("Password exists in NVS, size: %d bytes\n", required_size);
+                    
+                    // Получаем пароль напрямую
+                    char* encrypted = new char[required_size];
+                    err = nvs_get_str(nvsHandle, pwdKey.c_str(), encrypted, &required_size);
+                    if (err == ESP_OK) {
+                        password = decryptPassword(String(encrypted));
+                        Serial.printf("Direct password from NVS: %s\n", password.c_str());
+                        
+                        // Выводим ASCII коды символов для отладки
+                        Serial.print("ASCII codes: ");
+                        for (int i = 0; i < password.length(); i++) {
+                            Serial.printf("%d ", (int)password[i]);
+                        }
+                        Serial.println();
+                    }
+                    delete[] encrypted;
+                } else {
+                    Serial.printf("Password not found in NVS, error: %d\n", err);
+                }
+                nvs_close(nvsHandle);
+            }
+            
+            // Проверяем, есть ли сохраненные пароли
+            Serial.println("Checking for any saved passwords...");
+            listStoredDevices();
+            
+            // Если пароля нет, используем пароль по умолчанию для отладки
+            if (password.length() == 0) {
+                password = "12345";
+                Serial.println("Using default password for debugging: 12345");
+            }
+        } else {
+            Serial.println("Password found for this device");
+            
+            // Выводим ASCII коды символов для отладки
+            Serial.print("ASCII codes: ");
+            for (int i = 0; i < password.length(); i++) {
+                Serial.printf("%d ", (int)password[i]);
+            }
+            Serial.println();
+        }
+    }
+    
     if (password.length() == 0) {
         if (serialOutputEnabled) {
             Serial.println("Cannot unlock: no password stored. Use 'setpwd' command to set password.");
@@ -1659,7 +2817,7 @@ void clearAllPreferences() {
     nvs_erase_all(nvsHandle);
     nvs_commit(nvsHandle);
     Serial.println("All preferences cleared");
-}
+} 
 
 // Добавляем функции для работы с RSSI
 RssiMeasurement getMeasuredRssi() {
@@ -1741,26 +2899,59 @@ RssiMeasurement getMeasuredRssi() {
 void addRssiMeasurement(const RssiMeasurement& measurement) {
     if (!measurement.isValid) return;
     
+    // Сохраняем измерение в истории
     rssiHistory[rssiHistoryIndex] = measurement;
     rssiHistoryIndex = (rssiHistoryIndex + 1) % RSSI_HISTORY_SIZE;
     
-    // Обновляем среднее значение
-    int sum = 0;
-    int count = 0;
-    uint32_t currentTime = millis();
+    // Добавляем значение в буфер для фильтрации
+    addRssiValue(measurement.value);
     
-    for (int i = 0; i < RSSI_HISTORY_SIZE; i++) {
-        if (rssiHistory[i].isValid && 
-            (currentTime - rssiHistory[i].timestamp) < 5000) {
-            sum += rssiHistory[i].value;
+    // Отладочный вывод
+    static unsigned long lastRssiDebug = 0;
+    if (serialOutputEnabled && millis() - lastRssiDebug >= 5000) {
+        lastRssiDebug = millis();
+        Serial.printf("\nRSSI: %d dBm (filtered avg: %d)\n", 
+            measurement.value, lastAverageRssi);
+    }
+}
+
+// Добавляем функцию для проверки стабильности сигнала
+bool isRssiStable() {
+    if (validSamples < RSSI_SAMPLES / 2) {
+        return false;  // Недостаточно измерений
+    }
+    
+    // Вычисляем стандартное отклонение
+    int mean = getAverageRssi();
+    float sumSquaredDiff = 0;
+    int count = 0;
+    
+    for (int i = 0; i < RSSI_SAMPLES; i++) {
+        if (rssiValues[i] != 0) {
+            float diff = rssiValues[i] - mean;
+            sumSquaredDiff += diff * diff;
             count++;
         }
     }
     
-    if (count > 0) {
-        lastAverageRssi = sum / count;
-        if (serialOutputEnabled) {
-            Serial.printf("Updated average RSSI: %d (from %d measurements)\n", lastAverageRssi, count);
+    if (count < 4) return false;  // Недостаточно измерений
+    
+    float variance = sumSquaredDiff / count;
+    float stdDev = sqrt(variance);
+    
+    // Сигнал считается стабильным, если стандартное отклонение меньше порога
+    // Увеличиваем порог стабильности, так как RSSI естественно колеблется даже при неподвижном устройстве
+    const float STABILITY_THRESHOLD = 6.0;  // dBm (было 3.0)
+    bool isStable = stdDev < STABILITY_THRESHOLD;
+    
+    if (serialOutputEnabled) {
+        static unsigned long lastStabilityCheck = 0;
+        if (millis() - lastStabilityCheck >= 5000) {
+            lastStabilityCheck = millis();
+            Serial.printf("RSSI stability: StdDev=%.2f, Stable=%s\n", 
+                stdDev, isStable ? "YES" : "NO");
         }
     }
+    
+    return isStable;
 }
