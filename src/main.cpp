@@ -21,6 +21,7 @@ static int rssiHistoryIndex = 0;
 static int lastAverageRssi = 0;
 
 // В начале файла после включений, до определения переменных
+#define NVS_NAMESPACE "m5kb_v1"
 
 // Структура для хранения настроек устройства
 struct DeviceSettings {
@@ -40,6 +41,10 @@ String decryptPassword(const String& encrypted);
 bool isRssiStable();
 void clearAllPreferences();
 String cleanMacAddress(const char* macAddress);  // Добавляем прототип
+void temporaryScreenOn();
+void checkTemporaryScreen();
+String getDevicePassword(const String& shortKey);
+void updateCurrentShortKey(const char* deviceAddress);
 
 // Глобальные переменные и определения
 extern nvs_handle_t nvsHandle;  // Объявляем как внешнюю переменную
@@ -492,6 +497,13 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
         connected = true;
         connectedDeviceAddress = NimBLEAddress(desc->peer_ota_addr).toString();
+        
+        // Обновляем короткий ключ устройства
+        updateCurrentShortKey(connectedDeviceAddress.c_str());
+        
+        if (serialOutputEnabled) {
+            Serial.println("Short key updated");
+        }
 
         // Сохраняем информацию о подключении
         connection_info.connected = true;
@@ -1648,6 +1660,7 @@ static const uint8_t BRIGHTNESS_MAX = 100;    // Максимальная ярк
 static const uint8_t BRIGHTNESS_NORMAL = 50;  // Нормальная яркость
 static const uint8_t BRIGHTNESS_LOW = 20;     // Пониженная яркость
 static const uint8_t BRIGHTNESS_MIN = 0;      // Выключенный экран
+static const uint8_t BRIGHTNESS_MEDIUM = 70;  // Средняя яркость для временного включения экрана
 
 // Добавляем константы для яркости в начало файла
 static const uint8_t BRIGHTNESS_USB = 100;     // Яркость при USB питании
@@ -1667,6 +1680,10 @@ static bool wasConnected = true;
 
 // После других static переменных
 static String currentShortKey = "";
+
+// Глобальные переменные для управления временным включением экрана
+static unsigned long screenOnTime = 0;
+static bool screenTemporaryOn = false;
 
 // Функция обновления состояния питания
 void updatePowerStatus() {
@@ -2236,6 +2253,48 @@ void loop() {
     static bool reconnectAttempted = false;
     
     M5.update();
+    
+    // Обработка нажатий кнопок
+    if (M5.BtnA.wasPressed()) {
+        if (serialOutputEnabled) {
+            Serial.println("Button A pressed - turning screen on temporarily");
+        }
+        temporaryScreenOn();
+    }
+    
+    if (M5.BtnB.wasPressed()) {
+        if (serialOutputEnabled) {
+            Serial.println("Button B pressed - typing password");
+        }
+        
+        // Обновляем короткий ключ на случай, если он не был установлен
+        if (currentShortKey.length() == 0 && connectedDeviceAddress.length() > 0) {
+            currentShortKey = cleanMacAddress(connectedDeviceAddress.c_str());
+            if (serialOutputEnabled) {
+                Serial.printf("Updated current short key: %s\n", currentShortKey.c_str());
+            }
+        }
+        
+        if (serialOutputEnabled) {
+            Serial.printf("Current short key: %s\n", currentShortKey.c_str());
+        }
+        
+        // Получаем пароль для текущего устройства
+        String password = getDevicePassword(currentShortKey);
+        if (password.length() > 0) {
+            if (serialOutputEnabled) {
+                Serial.printf("Password found, length: %d\n", password.length());
+            }
+            typePassword(password);
+        } else {
+            if (serialOutputEnabled) {
+                Serial.println("No password stored for current device");
+            }
+        }
+    }
+    
+    // Проверяем, не пора ли выключить временно включенный экран
+    checkTemporaryScreen();
     
     // Проверяем питание и яркость каждые 500мс
     if (millis() - lastVoltageCheck >= 500) {
@@ -2954,4 +3013,135 @@ bool isRssiStable() {
     }
     
     return isStable;
+}
+
+// Функция для временного включения экрана на среднюю яркость
+void temporaryScreenOn() {
+    // Включаем экран на среднюю яркость
+    M5.Display.setBrightness(BRIGHTNESS_MEDIUM);
+    screenOnTime = millis();
+    screenTemporaryOn = true;
+    
+    if (serialOutputEnabled) {
+        Serial.println("Screen temporarily turned on for 10 seconds");
+        Serial.printf("Screen on time set to: %lu\n", screenOnTime);
+    }
+}
+
+// Функция для проверки и выключения временно включенного экрана
+void checkTemporaryScreen() {
+    // Если экран был временно включен и прошло 10 секунд
+    if (screenTemporaryOn && (millis() - screenOnTime >= 10000)) {
+        if (serialOutputEnabled) {
+            Serial.printf("Screen timeout check: current=%lu, on_time=%lu, diff=%lu\n", 
+                millis(), screenOnTime, millis() - screenOnTime);
+        }
+        
+        screenTemporaryOn = false;
+        
+        // Возвращаем яркость в зависимости от текущего состояния
+        esp_power_level_t currentPower = (esp_power_level_t)NimBLEDevice::getPower();
+        
+        // Принудительно устанавливаем яркость в зависимости от питания
+        if (isUSBConnected()) {
+            M5.Display.setBrightness(BRIGHTNESS_USB);
+            if (serialOutputEnabled) {
+                Serial.printf("Forced brightness to USB level: %d\n", BRIGHTNESS_USB);
+            }
+        } else {
+            // Используем adjustBrightness для установки яркости в зависимости от мощности передатчика
+            adjustBrightness(currentPower);
+        }
+        
+        if (serialOutputEnabled) {
+            Serial.println("Temporary screen timeout - returning to normal brightness");
+        }
+    }
+}
+
+// Функция для получения пароля устройства из NVS
+String getDevicePassword(const String& shortKey) {
+    if (shortKey.length() == 0) {
+        if (serialOutputEnabled) {
+            Serial.println("Error: Empty device key");
+        }
+        return "";
+    }
+    
+    if (serialOutputEnabled) {
+        Serial.printf("Getting password for device with short key: %s\n", shortKey.c_str());
+    }
+    
+    // Открываем хранилище
+    nvs_handle_t nvsHandle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvsHandle);
+    if (err != ESP_OK) {
+        if (serialOutputEnabled) {
+            Serial.printf("Error opening NVS: %s\n", esp_err_to_name(err));
+        }
+        return "";
+    }
+    
+    // Формируем ключ для пароля
+    String passwordKey = "pwd_" + shortKey;
+    
+    if (serialOutputEnabled) {
+        Serial.printf("Looking for password with key: %s\n", passwordKey.c_str());
+    }
+    
+    // Получаем размер строки
+    size_t required_size = 0;
+    err = nvs_get_str(nvsHandle, passwordKey.c_str(), NULL, &required_size);
+    if (err != ESP_OK) {
+        if (serialOutputEnabled) {
+            Serial.printf("Error getting password size: %s\n", esp_err_to_name(err));
+        }
+        nvs_close(nvsHandle);
+        return "";
+    }
+    
+    // Выделяем буфер и получаем строку
+    char* buffer = (char*)malloc(required_size);
+    if (buffer == NULL) {
+        if (serialOutputEnabled) {
+            Serial.println("Memory allocation failed");
+        }
+        nvs_close(nvsHandle);
+        return "";
+    }
+    
+    err = nvs_get_str(nvsHandle, passwordKey.c_str(), buffer, &required_size);
+    if (err != ESP_OK) {
+        if (serialOutputEnabled) {
+            Serial.printf("Error getting password: %s\n", esp_err_to_name(err));
+        }
+        free(buffer);
+        nvs_close(nvsHandle);
+        return "";
+    }
+    
+    String encryptedPassword = String(buffer);
+    free(buffer);
+    nvs_close(nvsHandle);
+    
+    if (serialOutputEnabled) {
+        Serial.printf("Encrypted password retrieved, length: %d\n", encryptedPassword.length());
+    }
+    
+    // Расшифровываем пароль
+    String password = decryptPassword(encryptedPassword);
+    
+    if (serialOutputEnabled) {
+        Serial.printf("Decrypted password, length: %d\n", password.length());
+    }
+    
+    return password;
+}
+
+// Функция для обновления короткого ключа устройства
+void updateCurrentShortKey(const char* deviceAddress) {
+    currentShortKey = cleanMacAddress(deviceAddress);
+    if (serialOutputEnabled) {
+        Serial.printf("Updated current short key to: %s\n", currentShortKey.c_str());
+    }
 }
