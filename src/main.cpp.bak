@@ -7,9 +7,6 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 
-// Объявление глобальной переменной nvsHandle
-nvs_handle_t nvsHandle;
-
 // Добавляем эти строки сразу после включений
 #define RSSI_HISTORY_SIZE 10
 
@@ -31,6 +28,7 @@ struct DeviceSettings {
     int unlockRssi;     // Минимальный RSSI для разблокировки
     int lockRssi;       // RSSI для блокировки
     String password;    // Пароль (зашифрованный)
+    bool isLocked;      // Статус блокировки конкретного устройства
 };
 
 void unlockComputer();
@@ -48,8 +46,13 @@ void temporaryScreenOn();
 void checkTemporaryScreen();
 String getDevicePassword(const String& shortKey);
 void updateCurrentShortKey(const char* deviceAddress);
+bool getLockState(const String& deviceAddress);
+bool getLockState();
+void setLockState(const String& deviceAddress, bool locked);
+void setLockState(bool locked);
 
 // Глобальные переменные и определения
+extern nvs_handle_t nvsHandle;  // Объявляем как внешнюю переменную
 static const int RSSI_FAR_THRESHOLD = -65;
 
 // В начале файла после всех включений и перед функциями
@@ -107,7 +110,7 @@ static const int RSSI_LOCK_THRESHOLD = -65;    // Порог для блокир
 static const int SAMPLES_TO_CONFIRM = 5;       // Увеличиваем до 5 измерений
 
 // Добавляем переменные для стабилизации изменений состояния
-static const unsigned long STATE_CHANGE_DELAY = 20000;  // 20 секунд между изменениями состояния
+static const unsigned long STATE_CHANGE_DELAY = 20000;  // Минимальное время между изменениями состояния (20 секунд, было 10)
 static unsigned long lastStateChangeTime = 0;           // Время последнего изменения состояния
 static int consecutiveUnlockSamples = 0;                // Счетчик последовательных измерений для разблокировки
 static int consecutiveLockSamples = 0;                  // Счетчик последовательных измерений для блокировки
@@ -155,10 +158,12 @@ void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& setti
     String pwdKey = "pwd_" + shortKey;
     String unlockKey = "unlock_" + shortKey;
     String lockKey = "lock_" + shortKey;
+    String isLockedKey = "locked_" + shortKey;
     
     Serial.printf("Password key: %s\n", pwdKey.c_str());
     Serial.printf("Unlock key: %s\n", unlockKey.c_str());
     Serial.printf("Lock key: %s\n", lockKey.c_str());
+    Serial.printf("Is Locked key: %s\n", isLockedKey.c_str());
     
     // Если под этим ключом уже записана строка, а новая короче – нужно стереть старую запись
     esp_err_t eraseErr = nvs_erase_key(nvsHandle, pwdKey.c_str());
@@ -188,6 +193,11 @@ void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& setti
         Serial.printf("Error saving lock RSSI: %d\n", err);
     }
     
+    err = nvs_set_i8(nvsHandle, isLockedKey.c_str(), settings.isLocked ? 1 : 0);
+    if (err != ESP_OK) {
+        Serial.printf("Error saving lock status: %d\n", err);
+    }
+    
     err = nvs_commit(nvsHandle);
     if (err != ESP_OK) {
         Serial.printf("Error committing settings: %d\n", err);
@@ -201,6 +211,7 @@ DeviceSettings getDeviceSettings(const String& deviceAddress) {
     DeviceSettings settings;
     settings.unlockRssi = RSSI_NEAR_THRESHOLD;
     settings.lockRssi = RSSI_FAR_THRESHOLD;
+    settings.isLocked = false; // По умолчанию устройство не заблокировано
     
     String shortKey = cleanMacAddress(deviceAddress.c_str());
     char pwd[64] = {0};
@@ -217,6 +228,11 @@ DeviceSettings getDeviceSettings(const String& deviceAddress) {
     
     if (nvs_get_i32(nvsHandle, ("lock_" + shortKey).c_str(), &value) == ESP_OK) {
         settings.lockRssi = value;
+    }
+    
+    int8_t locked;
+    if (nvs_get_i8(nvsHandle, ("locked_" + shortKey).c_str(), &locked) == ESP_OK) {
+        settings.isLocked = (locked == 1);
     }
     
     return settings;
@@ -301,15 +317,21 @@ int getAverageRssi() {
     // Суммируем только средние значения
     for (int i = skipCount; i < validCount - skipCount; i++) {
         sum += sortedValues[i];
-        count++;
-    }
+            count++;
+        }
     
     // Вычисляем среднее с отброшенными выбросами
     int filteredAverage = count > 0 ? sum / count : 0;
     
     // Применяем экспоненциальное скользящее среднее для сглаживания
-    const float alpha = 0.3;
-    exponentialAverage = alpha * filteredAverage + (1 - alpha) * exponentialAverage;
+    if (!exponentialAverageInitialized) {
+        exponentialAverage = filteredAverage;
+        exponentialAverageInitialized = true;
+    } else {
+        // Коэффициент сглаживания: 0.3 означает, что новое значение имеет вес 30%
+        const float alpha = 0.3;
+        exponentialAverage = alpha * filteredAverage + (1 - alpha) * exponentialAverage;
+    }
     
     return (int)exponentialAverage;
 }
@@ -1836,6 +1858,7 @@ void adjustTransmitPower(DeviceState state, int rssi) {
 }
 
 // В начале файла после определений
+nvs_handle_t nvsHandle;
 
 void initStorage() {
     Serial.println("Initializing storage...");
@@ -1860,27 +1883,32 @@ void initStorage() {
 }
 
 void checkLockState() {
-    Serial.println("Checking lock state...");
+    Serial.println("\n=== Checking Lock State ===");
     
-    int8_t isLocked = 0;
+    // Проверяем статус последнего заблокированного устройства
     char lastAddr[32] = {0};
     size_t length = sizeof(lastAddr);
     
-    esp_err_t err = nvs_get_i8(nvsHandle, "is_locked", &isLocked);
-    if (err != ESP_OK) {
-        Serial.printf("Error reading lock state: %d\n", err);
-        return;
+    if (nvs_get_str(nvsHandle, KEY_LAST_ADDR, lastAddr, &length) == ESP_OK && strlen(lastAddr) > 0) {
+        Serial.printf("Last locked device: %s\n", lastAddr);
+        
+        // Проверяем, заблокировано ли оно еще
+        bool isLocked = getLockState(String(lastAddr));
+        Serial.printf("Lock state: %s\n", isLocked ? "LOCKED" : "UNLOCKED");
+    } else {
+        Serial.println("No last locked device found");
     }
     
-    err = nvs_get_str(nvsHandle, "last_addr", lastAddr, &length);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        Serial.printf("Error reading last address: %d\n", err);
-        return;
+    // Проверяем статус текущего подключенного устройства, если оно отличается от последнего
+    if (connectedDeviceAddress.length() > 0 && 
+        (strlen(lastAddr) == 0 || strcmp(connectedDeviceAddress.c_str(), lastAddr) != 0)) {
+        
+        Serial.printf("Current connected device: %s\n", connectedDeviceAddress.c_str());
+        bool isLocked = getLockState(connectedDeviceAddress.c_str());
+        Serial.printf("Lock state: %s\n", isLocked ? "LOCKED" : "UNLOCKED");
     }
     
-    Serial.printf("Lock state: %s, Last addr: %s\n", 
-        isLocked ? "LOCKED" : "UNLOCKED", 
-        lastAddr);
+    Serial.println("=== End Checking Lock State ===\n");
 }
 
 // Функция для установки состояния блокировки
@@ -2161,27 +2189,24 @@ void setup() {
     consecutiveUnlockSamples = 0;
     
     // Проверяем предыдущее состояние
-    int8_t wasLocked = 0;
     char lastAddr[32] = {0};
     size_t length = sizeof(lastAddr);
     
-    if (nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &wasLocked) == ESP_OK &&
-        nvs_get_str(nvsHandle, KEY_LAST_ADDR, lastAddr, &length) == ESP_OK) {
+    if (nvs_get_str(nvsHandle, KEY_LAST_ADDR, lastAddr, &length) == ESP_OK && strlen(lastAddr) > 0) {
+        String lastDevice = String(lastAddr);
+        bool wasLocked = getLockState(lastDevice);
         
-        if (wasLocked && strlen(lastAddr) > 0) {
+        if (wasLocked) {
             currentState = LOCKED;
-            connectedDeviceAddress = lastAddr;
+            connectedDeviceAddress = lastAddr; // Используем char* вместо String
             Serial.println("\n=== Previous state was LOCKED ===");
-            Serial.printf("Last connected device: %s\n", lastAddr);
+            Serial.printf("Last locked device: %s\n", lastDevice.c_str());
             
             // Если устройство было заблокировано, но мы переподключились,
-            // попробуем автоматически разблокировать его
+            // попробуем автоматически разблокировать его при восстановлении соединения
             if (serialOutputEnabled) {
                 Serial.println("Will attempt to unlock when device reconnects");
             }
-        } else {
-            nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 0);
-            nvs_commit(nvsHandle);
         }
     }
     
@@ -2570,41 +2595,50 @@ void loop() {
             
             // Логика разблокировки компьютера
     if (currentState == LOCKED) {
-                // Используем скользящее среднее для разблокировки, чтобы избежать ложных срабатываний
-                if (lastAverageRssi > RSSI_NEAR_THRESHOLD) {
-                    consecutiveUnlockSamples++;
-                    if (serialOutputEnabled) {
-                        Serial.printf("Signal above unlock threshold (%d > %d), sample %d/%d, stable=%s\n", 
-                            lastAverageRssi, RSSI_NEAR_THRESHOLD, consecutiveUnlockSamples, 
-                            CONSECUTIVE_SAMPLES_NEEDED, stable ? "YES" : "NO");
-                    }
-                    
-                    // Для разблокировки требуем больше последовательных измерений и более длительное время
-                    // Это предотвратит ложные разблокировки из-за временных колебаний сигнала
-                    int requiredSamples = CONSECUTIVE_SAMPLES_NEEDED + 2; // Увеличиваем количество требуемых измерений
-                    
-                    // Если достаточно последовательных измерений, прошло достаточно времени и сигнал относительно стабилен
-                    if (consecutiveUnlockSamples >= requiredSamples && canChangeState) {
+                // Сначала проверяем, что текущее устройство было заблокировано
+                bool isCurrentDeviceLocked = getLockState(connectedDeviceAddress.c_str());
+                
+                // Разблокировываем только если устройство было заблокировано
+                if (isCurrentDeviceLocked) {
+                    // Используем скользящее среднее для разблокировки, чтобы избежать ложных срабатываний
+                    if (lastAverageRssi > RSSI_NEAR_THRESHOLD) {
+                        consecutiveUnlockSamples++;
                         if (serialOutputEnabled) {
-                            Serial.printf("Signal consistently above threshold for %d samples, unlocking...\n", 
-                                consecutiveUnlockSamples);
+                            Serial.printf("Signal above unlock threshold (%d > %d), sample %d/%d, stable=%s\n", 
+                                lastAverageRssi, RSSI_NEAR_THRESHOLD, consecutiveUnlockSamples, 
+                                CONSECUTIVE_SAMPLES_NEEDED, stable ? "YES" : "NO");
                         }
-                    unlockComputer();
-                        currentState = NORMAL;
-                        lastStateChangeTime = millis();
-                        consecutiveLockSamples = 0;
-                        consecutiveUnlockSamples = 0;
+                        
+                        // Для разблокировки требуем больше последовательных измерений и более длительное время
+                        // Это предотвратит ложные разблокировки из-за временных колебаний сигнала
+                        int requiredSamples = CONSECUTIVE_SAMPLES_NEEDED + 2; // Увеличиваем количество требуемых измерений
+                        
+                        // Если достаточно последовательных измерений, прошло достаточно времени и сигнал относительно стабилен
+                        if (consecutiveUnlockSamples >= requiredSamples && canChangeState) {
+                            if (serialOutputEnabled) {
+                                Serial.printf("Signal consistently above threshold for %d samples, unlocking...\n", 
+                                    consecutiveUnlockSamples);
+                            }
+                            unlockComputer();
+                            currentState = NORMAL;
+                            lastStateChangeTime = millis();
+                            consecutiveLockSamples = 0;
+                            consecutiveUnlockSamples = 0;
+                        }
+                    } else {
+                        // Не сбрасываем счетчик полностью при небольших колебаниях сигнала
+                        // Это позволит разблокировать устройство даже при небольших колебаниях сигнала
+                        if (lastAverageRssi < RSSI_NEAR_THRESHOLD - 5) {
+                            // Сбрасываем счетчик только если сигнал значительно ухудшился
+                            consecutiveUnlockSamples = 0;
+                        } else if (consecutiveUnlockSamples > 0) {
+                            // Уменьшаем счетчик, но не сбрасываем полностью при небольших колебаниях
+                            consecutiveUnlockSamples--;
+                        }
                     }
-                } else {
-                    // Не сбрасываем счетчик полностью при небольших колебаниях сигнала
-                    // Это позволит разблокировать устройство даже при небольших колебаниях сигнала
-                    if (lastAverageRssi < RSSI_NEAR_THRESHOLD - 5) {
-                        // Сбрасываем счетчик только если сигнал значительно ухудшился
-                        consecutiveUnlockSamples = 0;
-                    } else if (consecutiveUnlockSamples > 0) {
-                        // Уменьшаем счетчик, но не сбрасываем полностью при небольших колебаниях
-                        consecutiveUnlockSamples--;
-                    }
+                } else if (serialOutputEnabled) {
+                    // Выводим сообщение, что текущее устройство не является тем, которое было заблокировано
+                    Serial.println("Current device is not the one that was locked. Unlock not attempted.");
                 }
             }
         }
@@ -2647,10 +2681,17 @@ void lockComputer() {
     NimBLEDevice::setPower(POWER_LOCKED);
     
     if (success) {
-        // Сохраняем состояние блокировки и адрес устройства
-        nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 1);
+        // Сохраняем состояние блокировки для конкретного устройства
+        String deviceAddr = connectedDeviceAddress.c_str();
+        DeviceSettings settings = getDeviceSettings(deviceAddr);
+        settings.isLocked = true;
+        saveDeviceSettings(deviceAddr, settings);
+        
+        // Сохраняем адрес последнего заблокированного устройства
+        nvs_set_str(nvsHandle, KEY_LAST_ADDR, deviceAddr.c_str());
         nvs_commit(nvsHandle);
-        Serial.println("Lock state saved to NVS");
+        
+        Serial.println("Lock state saved for device: " + deviceAddr);
     }
     
     if (!success) {
@@ -2768,9 +2809,12 @@ void unlockComputer() {
             // 2. Вводим пароль
             typePassword(password);
             
-            // 3. Сбрасываем состояние блокировки
-            nvs_set_i8(nvsHandle, KEY_IS_LOCKED, 0);
-            nvs_commit(nvsHandle);
+            // 3. Сбрасываем состояние блокировки для конкретного устройства
+            String deviceAddr = connectedDeviceAddress.c_str();
+            DeviceSettings settings = getDeviceSettings(deviceAddr);
+            settings.isLocked = false;
+            saveDeviceSettings(deviceAddr, settings);
+            
             currentState = NORMAL;
             
             Serial.println("Computer unlocked successfully!");
@@ -2995,7 +3039,7 @@ bool isRssiStable() {
     
     // Сигнал считается стабильным, если стандартное отклонение меньше порога
     // Увеличиваем порог стабильности, так как RSSI естественно колеблется даже при неподвижном устройстве
-    const float STABILITY_THRESHOLD = 6.0;  // Увеличен порог с 3.0 до 6.0 dBm
+    const float STABILITY_THRESHOLD = 6.0;  // dBm (было 3.0)
     bool isStable = stdDev < STABILITY_THRESHOLD;
     
     if (serialOutputEnabled) {
@@ -3139,4 +3183,68 @@ void updateCurrentShortKey(const char* deviceAddress) {
     if (serialOutputEnabled) {
         Serial.printf("Updated current short key to: %s\n", currentShortKey.c_str());
     }
+}
+
+// Функция для получения состояния блокировки конкретного устройства
+bool getLockState(const String& deviceAddress) {
+    DeviceSettings settings = getDeviceSettings(deviceAddress);
+    return settings.isLocked;
+}
+
+// Перегрузка функции для получения статуса текущего подключенного устройства
+bool getLockState() {
+    if (connectedDeviceAddress.length() == 0) {
+        Serial.println("No connected device to check lock state");
+        return false;
+    }
+    return getLockState(connectedDeviceAddress.c_str());
+}
+
+// Функция для установки состояния блокировки конкретного устройства
+void setLockState(const String& deviceAddress, bool locked) {
+    DeviceSettings settings = getDeviceSettings(deviceAddress);
+    settings.isLocked = locked;
+    saveDeviceSettings(deviceAddress, settings);
+    
+    if (locked) {
+        // Если блокируем, то сохраняем адрес последнего заблокированного устройства
+        nvs_set_str(nvsHandle, KEY_LAST_ADDR, deviceAddress.c_str());
+        nvs_commit(nvsHandle);
+    }
+    
+    Serial.printf("Lock state for device %s set to: %s\n", 
+                  deviceAddress.c_str(), 
+                  locked ? "LOCKED" : "UNLOCKED");
+}
+
+// Перегрузка функции для установки статуса текущего подключенного устройства
+void setLockState(bool locked) {
+    if (connectedDeviceAddress.length() == 0) {
+        Serial.println("No connected device to set lock state");
+        return;
+    }
+    setLockState(connectedDeviceAddress.c_str(), locked);
+}
+
+// Функция для установки глобального состояния блокировки (старая версия)
+void setGlobalLockState(bool locked) {
+    esp_err_t err = nvs_set_i8(nvsHandle, KEY_IS_LOCKED, locked ? 1 : 0);
+    if (err != ESP_OK) {
+        Serial.printf("Error setting lock state: %d\n", err);
+        return;
+    }
+    err = nvs_commit(nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("Error committing lock state: %d\n", err);
+    }
+}
+
+// Функция для получения глобального состояния блокировки (старая версия)
+bool getGlobalLockState() {
+    int8_t locked = 0;
+    esp_err_t err = nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &locked);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        Serial.printf("Error getting lock state: %d\n", err);
+    }
+    return locked != 0;
 }
