@@ -11,6 +11,7 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include "device/DeviceLockState.h"
+#include "device/DeviceSettings.h"
 #include "rssi/RSSIManager.h"
 
 #define NVS_NAMESPACE "m5kb_v1"
@@ -104,7 +105,8 @@ bool shouldLockComputer() {
     if (!connected) return false;
     if (currentState == LOCKED) return false;
     
-    DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
+    auto& deviceSettings = DeviceSettingsManager::getInstance();
+    DeviceSettings settings = deviceSettings.getDeviceSettings(connectedDeviceAddress.c_str());
     static bool wasNear = false;
     static int samplesBelow = 0;
     static bool lockSent = false;
