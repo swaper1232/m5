@@ -4,48 +4,32 @@
 #include "esp_gap_ble_api.h"
 #include "NimBLEClient.h"
 #include <M5Unified.h>
+#include <M5StickCPlus2.h>
+#include <SPIFFS.h>
+#include "PowerManager.h"
+#include "RssiUtils.h"
+#include "DeviceStateManager.h"
+#include "DeviceSettingsUtils.h"
 #include <nvs_flash.h>
 #include <nvs.h>
+#include <string>
+
 #include "NvsUtils.h"
-#include "DeviceSettingsUtils.h" // Добавляем include для нового модуля
 
 // Добавляем эти строки сразу после включений
 #define RSSI_HISTORY_SIZE 10
 
-struct RssiMeasurement {
-    int value;
-    uint32_t timestamp;
-    bool isValid;
-};
-
-static RssiMeasurement rssiHistory[RSSI_HISTORY_SIZE] = {};
-static int rssiHistoryIndex = 0;
-static int lastAverageRssi = 0;
-
 // В начале файла после включений, до определения переменных
-
-// Структура для хранения настроек устройства
-struct DeviceSettings {
-    int unlockRssi;     // Минимальный RSSI для разблокировки
-    int lockRssi;       // RSSI для блокировки
-    String password;    // Пароль (зашифрованный)
-};
 
 void unlockComputer();
 void lockComputer();
 String getPasswordForDevice(const String& deviceAddress);
 void savePasswordForDevice(const String& deviceAddress, const String& password);
-DeviceSettings getDeviceSettings(const String& deviceAddress);
-void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings);
 
-bool isRssiStable();
-void clearAllPreferences();
-// String cleanMacAddress(const char* macAddress);  // Удаляем прототип
 void temporaryScreenOn();
 void checkTemporaryScreen();
 String getDevicePassword(const String& shortKey);
 void updateCurrentShortKey(const char* deviceAddress);
-void clearOldPasswords(); // Добавляем прототип новой функции
 
 // Глобальные переменные и определения
 static const int RSSI_FAR_THRESHOLD = -65;
@@ -99,7 +83,7 @@ static const int SIGNAL_LOSS_TIME = 5000;      // 5 секунд слабого 
 static unsigned long weakSignalStartTime = 0;   // Время начала слабого сигнала
 
 // Пороги для определения расстояния
-static const int RSSI_NEAR_THRESHOLD = -50;    // Когда мы близко к компьютеру
+const int RSSI_NEAR_THRESHOLD = -50;    // Когда мы близко к компьютеру
 static const int RSSI_LOCK_THRESHOLD = -65;    // Порог для блокировки
 static const int SAMPLES_TO_CONFIRM = 5;       // Увеличиваем до 5 измерений
 
@@ -122,11 +106,12 @@ enum DeviceState {
     APPROACHING     // Приближение к компьютеру
 };
 
-static DeviceState currentState = NORMAL;
+// Объявляем currentState как переменную типа из DeviceStateManager.h
+static DeviceState currentState;
 static unsigned long movementStartTime = 0;
 
 // Изменяем константы для хранения паролей
-static const char* KEY_PWD_PREFIX = "pwd_";  // Префикс для ключей паролей
+const char* KEY_PWD_PREFIX = "pwd_";  // Префикс для ключей паролей
 static const int MAX_STORED_PASSWORDS = 5;   // Максимум сохраненных паролей
 
 // Добавим более сложный ключ шифрования (32 байта)
@@ -138,80 +123,15 @@ void addRssiMeasurement(const RssiMeasurement& measurement);
 
 // Определения функций
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings) {
-    Serial.println("\n=== Saving Device Settings ===");
-    Serial.printf("Device address: %s\n", deviceAddress.c_str());
-    
-    String shortKey = cleanMacAddress(deviceAddress.c_str()); // Восстанавливаем вызов
-    Serial.printf("Short key: %s\n", shortKey.c_str());
-    
-    String pwdKey = "pwd_" + shortKey;
-    String unlockKey = "unlock_" + shortKey;
-    String lockKey = "lock_" + shortKey;
-    
-    Serial.printf("Password key: %s\n", pwdKey.c_str());
-    Serial.printf("Unlock key: %s\n", unlockKey.c_str());
-    Serial.printf("Lock key: %s\n", lockKey.c_str());
-    
-    // Если под этим ключом уже записана строка, а новая короче – нужно стереть старую запись
-    esp_err_t eraseErr = nvs_erase_key(nvsHandle, pwdKey.c_str());
-    if (eraseErr != ESP_OK && eraseErr != ESP_ERR_NVS_NOT_FOUND) {
-        Serial.printf("Error erasing old password key: %d\n", eraseErr);
-    } else {
-        // Делаем коммит после стирания ключа
-        esp_err_t commitErr = nvs_commit(nvsHandle);
-        if (commitErr != ESP_OK) {
-            Serial.printf("Error committing erase: %d\n", commitErr);
-        }
-    }
-    
-    esp_err_t err = nvs_set_str(nvsHandle, pwdKey.c_str(), settings.password.c_str());
-    if (err != ESP_OK) {
-        Serial.printf("Error saving password: %d\n", err);
-        return;
-    }
-    
-    err = nvs_set_i32(nvsHandle, unlockKey.c_str(), settings.unlockRssi);
-    if (err != ESP_OK) {
-        Serial.printf("Error saving unlock RSSI: %d\n", err);
-    }
-    
-    err = nvs_set_i32(nvsHandle, lockKey.c_str(), settings.lockRssi);
-    if (err != ESP_OK) {
-        Serial.printf("Error saving lock RSSI: %d\n", err);
-    }
-    
-    err = nvs_commit(nvsHandle);
-    if (err != ESP_OK) {
-        Serial.printf("Error committing settings: %d\n", err);
-    } else {
-        Serial.println("Settings saved successfully");
-    }
-    Serial.println("=== End Saving Settings ===\n");
+    // Перенаправляем вызов в функцию в DeviceSettingsUtils.h
+    DeviceSettings settingsCopy = settings;
+    ::saveDeviceSettings(deviceAddress, settingsCopy);
 }
 
 DeviceSettings getDeviceSettings(const String& deviceAddress) {
+    // Перенаправляем вызов в функцию в DeviceSettingsUtils.h
     DeviceSettings settings;
-    settings.unlockRssi = RSSI_NEAR_THRESHOLD;
-    settings.lockRssi = RSSI_FAR_THRESHOLD;
-    
-    String shortKey = cleanMacAddress(deviceAddress.c_str()); // Восстанавливаем вызов
-    
-    char pwd[64] = {0};
-    size_t length = sizeof(pwd);
-    
-    if (nvs_get_str(nvsHandle, ("pwd_" + shortKey).c_str(), pwd, &length) == ESP_OK) {
-        settings.password = String(pwd);
-    }
-    
-    int32_t value;
-    if (nvs_get_i32(nvsHandle, ("unlock_" + shortKey).c_str(), &value) == ESP_OK) {
-        settings.unlockRssi = value;
-    }
-    
-    if (nvs_get_i32(nvsHandle, ("lock_" + shortKey).c_str(), &value) == ESP_OK) {
-        settings.lockRssi = value;
-    }
-    
+    ::getDeviceSettings(deviceAddress, settings);
     return settings;
 }
 
@@ -242,14 +162,6 @@ static const uint8_t hidReportDescriptor[] = {
     0x81, 0x00,  // Input (Data, Array)
     0xc0         // End Collection
 };
-
-// Константы для измерения RSSI
-static const int RSSI_SAMPLES = 10;  // Увеличиваем количество измерений
-static int rssiValues[RSSI_SAMPLES] = {0};  // Инициализируем нулями
-static int rssiIndex = 0;
-static int validSamples = 0;  // Счетчик валидных измерений
-static float exponentialAverage = 0; // Экспоненциальное скользящее среднее
-static bool exponentialAverageInitialized = false; // Флаг инициализации
 
 // Улучшенная функция для получения среднего RSSI с фильтрацией выбросов
 int getAverageRssi() {
@@ -324,8 +236,11 @@ static int lastMovementCount = 0;  // Счетчик для отслеживан
 
 // Добавим функцию для обновления экрана
 void updateDisplay() {
+    // Получаем состояние блокировки из NVS
     int8_t isLocked = 0;
-    nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &isLocked);
+    if (loadGlobalLockState()) { // Используем функцию из NvsUtils.h
+        isLocked = 1;
+    }
     
     Disbuff->fillSprite(BLACK);
     Disbuff->setTextSize(2);
@@ -474,6 +389,9 @@ static MyScanCallbacks* scanCallbacks = new MyScanCallbacks();
 
 // Добавляем предварительное объявление для adjustBrightness
 void adjustBrightness(esp_power_level_t txPower);
+
+// Создаем глобальный объект PowerManager
+static PowerManager* powerManager = nullptr;
 
 // Затем класс для колбэков сервера
 class ServerCallbacks : public NimBLEServerCallbacks {
@@ -727,22 +645,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
     // Функция для адаптивного управления мощностью
     void adjustTransmitPower(DeviceState state, int rssi) {
-        esp_power_level_t newPower;
-
-        if (rssi > -35) {  // Очень близко
-            newPower = ESP_PWR_LVL_N12;  // Минимальная мощность
-        } else if (rssi > -45) {  // Близко
-            newPower = ESP_PWR_LVL_N9;
-        } else if (rssi > -55) {  // Средняя дистанция
-            newPower = ESP_PWR_LVL_N3;
-        } else if (rssi > -65) {  // Дальняя дистанция
-            newPower = ESP_PWR_LVL_P3;
-        } else {  // Очень далеко
-            newPower = ESP_PWR_LVL_P9;  // Максимальная мощность
-        }
-
-        NimBLEDevice::setPower(newPower);
-        adjustBrightness(newPower);  // Регулируем яркость
+        // Используем adjustTransmitPower из DeviceStateManager.h вместо повторения кода
+        ::adjustTransmitPower(state, rssi);
     }
 };
 
@@ -755,78 +659,12 @@ static esp_ble_scan_params_t scan_params = {
     .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE
 };
 
-// Функция определения необходимости блокировки
-bool shouldLockComputer(int avgRssi) {
-    if (!connected) return false;
-    
-    // Не блокируем, если уже заблокировано
-    if (currentState == LOCKED) return false;
-    
-    DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
-    static bool wasNear = false;
-    static int samplesBelow = 0;
-    static bool lockSent = false;  // Добавляем обратно флаг отправки
-    
-    // Используем индивидуальные настройки
-    if (avgRssi > settings.unlockRssi) {
-        wasNear = true;
-        samplesBelow = 0;
-        lockSent = false;  // Сбрасываем флаг
-        return false;
-    }
-    
-    if (wasNear && avgRssi < settings.lockRssi) {
-        samplesBelow++;
-        Serial.printf("Signal below threshold: %d/%d samples\n", 
-            samplesBelow, SAMPLES_TO_CONFIRM);
-            
-        // Если достаточно измерений подтверждают удаление
-        if (samplesBelow >= SAMPLES_TO_CONFIRM && !lockSent) {
-            Serial.println("!!! Lock condition detected !!!");
-            return true;
-        }
-    } else {
-        samplesBelow = 0;  // Сбрасываем счетчик если сигнал стал лучше
-    }
-    
-    return false;
-}
-
-// Объявляем прототипы функций
-String encryptPassword(const String& password);
-String decryptPassword(const String& encrypted);
-void clearAllPasswords();
-
 // Определяем функции
 
 void clearAllPasswords() {
-    Serial.println("\n=== Clearing passwords ===");
-    
-    // Получаем список всех ключей
-    nvs_iterator_t it = nvs_entry_find("nvs", "m5kb_v1", NVS_TYPE_STR);
-    while (it != NULL) {
-        nvs_entry_info_t info;
-        nvs_entry_info(it, &info);
-        String key = String(info.key);
-        
-        // Проверяем только ключи паролей
-        if (key.startsWith("pwd_")) {
-            String shortKey = key.substring(4); // Убираем "pwd_"
-            
-            // Если длина ключа больше 6 символов, это старый формат
-            if (shortKey.length() > 6) {
-                Serial.printf("Removing old key: %s\n", key.c_str());
-                nvs_erase_key(nvsHandle, key.c_str());
-                nvs_erase_key(nvsHandle, ("unlock_" + shortKey).c_str());
-                nvs_erase_key(nvsHandle, ("lock_" + shortKey).c_str());
-            }
-        }
-        it = nvs_entry_next(it);
-    }
-    nvs_release_iterator(it);
-    
+    nvs_erase_all(nvsHandle);
     nvs_commit(nvsHandle);
-    Serial.println("=== Passwords cleared ===\n");
+    Serial.println("All passwords cleared");
 }
 
 // Функция для получения пароля по адресу устройства
@@ -850,7 +688,10 @@ void savePasswordForDevice(const String& deviceAddress, const String& password) 
 
 // Вспомогательная функция для получения короткого ключа из MAC-адреса
 String getShortKey(const char* macAddress) {
-    return cleanMacAddress(macAddress);
+    // Убираем двоеточия и берем последние 8 символов
+    String cleanMac = String(macAddress);
+    cleanMac.replace(":", "");
+    return cleanMac.substring(cleanMac.length() - 8);
 }
 
 void listStoredDevices() {
@@ -1354,7 +1195,7 @@ void echoSerialInput() {
                     
                     // Проверяем наличие пароля для устройства 00:a7:41:02:4d:ac
                     String testAddress = "00:a7:41:02:4d:ac";
-                    String testShortKey = cleanMacAddress(testAddress.c_str());
+                    String testShortKey = getShortKey(testAddress.c_str());
                     String testPwdKey = "pwd_" + testShortKey;
                     
                     Serial.printf("\nChecking password for test device: %s\n", testAddress.c_str());
@@ -1387,6 +1228,9 @@ void echoSerialInput() {
                     
                     // Проверяем несколько известных ключей напрямую
                     const char* knownKeys[] = {
+                        "pwd_41024dac",  // 00:a7:41:02:4d:ac
+                        "unlock_41024dac",
+                        "lock_41024dac",
                         "paired",
                         "conn_handle",
                         "last_conn_time",
@@ -1638,10 +1482,6 @@ void echoSerialInput() {
                     Serial.printf("Serial output %s\n", 
                         serialOutputEnabled ? "enabled" : "disabled");
                 }
-                else if (inputBuffer == "clear") {
-                    clearAllPasswords();
-                    Serial.println("Old passwords cleared. Please set new password if needed.");
-                }
                 // ... все остальные существующие команды ...
                 
                 Serial.println("=== End of command ===\n");
@@ -1662,199 +1502,80 @@ static unsigned long lastUnlockAttempt = 0;
 static int failedUnlockAttempts = 0;        // Счетчик неудачных попыток
 static unsigned long lastFailedAttempt = 0;  // Время последней неудачной попытки
 
-// Добавим константы для управления мощностью
-static const esp_power_level_t POWER_NEAR_PC = ESP_PWR_LVL_N12;    // -12dBm минимальная
-static const esp_power_level_t POWER_LOCKED = ESP_PWR_LVL_N12;     // Меняем на минимальную в блоке
-static const esp_power_level_t POWER_RETURNING = ESP_PWR_LVL_P9;   // +9dBm максимальная
-
 // Оставляем новые константы для интервалов сканирования
-static const uint16_t SCAN_INTERVAL_NORMAL = 40;     // 25ms (40 * 0.625ms)
-static const uint16_t SCAN_WINDOW_NORMAL = 20;       // 12.5ms
-static const uint16_t SCAN_INTERVAL_LOCKED = 320;    // 200ms - сканируем реже
-static const uint16_t SCAN_WINDOW_LOCKED = 16;       // 10ms - меньше слушаем
+static const uint16_t SCAN_INTERVAL_SLOW = 120;      // 75ms (120 * 0.625ms)
+static const uint16_t SCAN_INTERVAL_BATTERY_SAVE = 800; // 500ms (800 * 0.625ms)
+static const uint16_t SCAN_WINDOW_NORMAL = 30;       // 18.75ms (30 * 0.625ms)
+static const uint16_t SCAN_WINDOW_SLOW = 30;         // 18.75ms (30 * 0.625ms)
+static const uint16_t SCAN_WINDOW_BATTERY_SAVE = 16; // 10ms (16 * 0.625ms)
 
-// Добавим константы для яркости
-static const uint8_t BRIGHTNESS_MAX = 100;    // Максимальная яркость
-static const uint8_t BRIGHTNESS_NORMAL = 50;  // Нормальная яркость
-static const uint8_t BRIGHTNESS_LOW = 20;     // Пониженная яркость
-static const uint8_t BRIGHTNESS_MIN = 0;      // Выключенный экран
-static const uint8_t BRIGHTNESS_MEDIUM = 70;  // Средняя яркость для временного включения экрана
-
-// Добавляем константы для яркости в начало файла
-static const uint8_t BRIGHTNESS_USB = 100;     // Яркость при USB питании
-static const uint8_t BRIGHTNESS_BATTERY = 30;  // Яркость от батареи
-
-// Добавляем после других static переменных
-static float batteryVoltage = 0;
-static float batteryLevel = 0;
-static const float VOLTAGE_THRESHOLD = -15.0;     // Допустимое падение напряжения
-static const float DISCONNECT_THRESHOLD = -25.0;   // Порог для определения отключения
-static const int VOLTAGE_HISTORY_SIZE = 10;
-static float voltageHistory[VOLTAGE_HISTORY_SIZE] = {0};
-static int historyIndex = 0;
-static bool historyFilled = false;
-static float maxAverageVoltage = 0;
-static bool wasConnected = true;
+// Удаляем дублирующиеся переменные, они уже есть в PowerManager.cpp
+// static float batteryVoltage = 0;
+// static float batteryLevel = 0;
+// static const float VOLTAGE_THRESHOLD = -15.0;
+// static const float DISCONNECT_THRESHOLD = -25.0;
+// static const int VOLTAGE_HISTORY_SIZE = 10;
+// static float voltageHistory[VOLTAGE_HISTORY_SIZE] = {0};
+// static int historyIndex = 0;
+// static bool historyFilled = false;
+// static float maxAverageVoltage = 0;
+// static bool wasConnected = true;
 
 // После других static переменных
 static String currentShortKey = "";
 
-// Глобальные переменные для управления временным включением экрана
-static unsigned long screenOnTime = 0;
-static bool screenTemporaryOn = false;
+// Удаляем глобальные переменные для управления временным включением экрана, они уже есть в PowerManager
+// static unsigned long screenOnTime = 0;
+// static bool screenTemporaryOn = false;
 
-// Функция обновления состояния питания
+// Оставляем вызовы к методам PowerManager
 void updatePowerStatus() {
-    // Обновляем базовые параметры
-    batteryVoltage = M5.Power.getBatteryVoltage();
-    batteryLevel = M5.Power.getBatteryLevel();
-    
-    // Обновляем историю измерений напряжения
-    voltageHistory[historyIndex] = batteryVoltage;
-    historyIndex = (historyIndex + 1) % VOLTAGE_HISTORY_SIZE;
-    if (historyIndex == 0) historyFilled = true;
-    
-    static bool wasUSB = true;
-    bool isUSB = M5.Power.isCharging();
-    
-    // Добавим защиту от частых изменений
-    static unsigned long lastChange = 0;
-    if (millis() - lastChange < 1000) {  // Минимум 1 секунда между изменениями
-        return;
-    }
-    
-    if (wasUSB != isUSB) {
-        lastChange = millis();
-        wasUSB = isUSB;
-        
-        // Устанавливаем яркость с задержкой
-        delay(10);
-        M5.Display.setBrightness(isUSB ? BRIGHTNESS_USB : BRIGHTNESS_BATTERY);
-        delay(10);
-        
-        if (serialOutputEnabled) {
-            Serial.printf("Power source changed: %s, brightness: %d\n",
-                isUSB ? "USB" : "Battery",
-                isUSB ? BRIGHTNESS_USB : BRIGHTNESS_BATTERY);
-        }
-    }
+    powerManager->updatePowerStatus();
 }
 
 float calculateAverageVoltage() {
-    float sum = 0;
-    int count = historyFilled ? VOLTAGE_HISTORY_SIZE : historyIndex;
-    if (count == 0) return 0;
-    
-    for (int i = 0; i < count; i++) {
-        sum += voltageHistory[i];
-    }
-    return sum / count;
+    return powerManager->calculateAverageVoltage();
 }
 
 bool isUSBConnected() {
-    if (!historyFilled && historyIndex < 3) return true;
-    
-    float avgVoltage = calculateAverageVoltage();
-    if (avgVoltage > maxAverageVoltage) {
-        maxAverageVoltage = avgVoltage;
-    }
-    
-    float voltageDrop = avgVoltage - maxAverageVoltage;
-    
-    if (wasConnected) {
-        if (voltageDrop < DISCONNECT_THRESHOLD) {
-            wasConnected = false;
-            return false;
-        }
-        return true;
-    } else {
-        if (voltageDrop > VOLTAGE_THRESHOLD) {
-            wasConnected = true;
-            return true;
-        }
-        return false;
-    }
+    return powerManager->isUSBConnected();
 }
 
 // Функция для управления яркостью в зависимости от мощности передатчика
 void adjustBrightness(esp_power_level_t txPower) {
-    static uint8_t currentBrightness = BRIGHTNESS_NORMAL;
-    uint8_t newBrightness;
-    
-    // Если подключен USB - не выключаем экран
-    if (isUSBConnected()) {
-        switch (txPower) {
-            case ESP_PWR_LVL_N12:  // Минимальная мощность
-                newBrightness = BRIGHTNESS_LOW;  // Минимальная, но не выключаем
-                break;
-            case ESP_PWR_LVL_N9:
-            case ESP_PWR_LVL_N6:
-                newBrightness = BRIGHTNESS_LOW;
-                break;
-            default:
-                newBrightness = BRIGHTNESS_NORMAL;
-        }
-    } else {
-        // Обычная логика для работы от батареи
-        switch (txPower) {
-            case ESP_PWR_LVL_N12:  // Минимальная мощность
-                newBrightness = BRIGHTNESS_MIN;  // Выключаем экран
-                break;
-            case ESP_PWR_LVL_N9:
-            case ESP_PWR_LVL_N6:
-                newBrightness = BRIGHTNESS_LOW;
-                break;
-            default:
-                newBrightness = BRIGHTNESS_NORMAL;
-        }
-    }
-
-    if (newBrightness != currentBrightness) {
-        if (serialOutputEnabled) {
-            Serial.printf("Adjusting brightness: %d -> %d (TX Power: %d, USB: %d)\n", 
-                currentBrightness, newBrightness, txPower, isUSBConnected());
-        }
-        M5.Display.setBrightness(newBrightness);
-        currentBrightness = newBrightness;
-    }
+    powerManager->adjustBrightness((PowerLevel)txPower);
 }
 
 // Функция для настройки параметров сканирования
 void adjustScanParameters(DeviceState state) {
-    if (!pScan) return;
-    
-    if (state == LOCKED) {
-        pScan->setInterval(SCAN_INTERVAL_LOCKED);
-        pScan->setWindow(SCAN_WINDOW_LOCKED);
-    } else {
-        pScan->setInterval(SCAN_INTERVAL_NORMAL);
-        pScan->setWindow(SCAN_WINDOW_NORMAL);
+    // Используем adjustScanParameters из DeviceStateManager.h вместо повторения кода
+    ::adjustScanParameters(state);
+
+    // Устаревший код, заменяемый на вызов функции из DeviceStateManager
+    /*
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    if (pScan) {
+        // Настраиваем параметры сканирования в зависимости от состояния
+        pScan->setFilterPolicy(BLE_HCI_SCAN_FILT_NO_WL);
+        pScan->setActiveScan(true);
+        
+        if (state == LOCKED) {
+            // Используем SCAN_INTERVAL_SLOW из DeviceStateManager.h вместо SCAN_INTERVAL_LOCKED
+            pScan->setInterval(SCAN_INTERVAL_SLOW);
+            pScan->setWindow(SCAN_WINDOW_SLOW);
+        } else {
+            // Используем SCAN_INTERVAL_NORMAL из DeviceStateManager.h
+            pScan->setInterval(SCAN_INTERVAL_NORMAL);
+            pScan->setWindow(SCAN_WINDOW_NORMAL);
+        }
     }
-    
-    if (pScan->isScanning()) {
-        pScan->stop();
-    }
-    pScan->start(0, false);
+    */
 }
 
 // Функция для адаптивного управления мощностью
 void adjustTransmitPower(DeviceState state, int rssi) {
-    esp_power_level_t newPower;
-    
-    if (rssi > -35) {  // Очень близко
-        newPower = ESP_PWR_LVL_N12;  // Минимальная мощность
-    } else if (rssi > -45) {  // Близко
-        newPower = ESP_PWR_LVL_N9;
-    } else if (rssi > -55) {  // Средняя дистанция
-        newPower = ESP_PWR_LVL_N3;
-    } else if (rssi > -65) {  // Дальняя дистанция
-        newPower = ESP_PWR_LVL_P3;
-    } else {  // Очень далеко
-        newPower = ESP_PWR_LVL_P9;  // Максимальная мощность
-    }
-    
-    NimBLEDevice::setPower(newPower);
-    adjustBrightness(newPower);  // Регулируем яркость
+    // Используем adjustTransmitPower из DeviceStateManager.h вместо повторения кода
+    ::adjustTransmitPower(state, rssi);
 }
 
 // В начале файла после определений
@@ -1907,8 +1628,28 @@ void checkLockState() {
 }
 
 void setup() {
-    auto cfg = M5.config();
-    M5.begin(cfg);
+    // Инициализация M5
+    M5.begin();
+    M5.Lcd.setBrightness(100);
+    
+    // Инициализация переменных
+    serialOutputEnabled = true;
+    
+    // Инициализация класса PowerManager
+    powerManager = new PowerManager(serialOutputEnabled);
+    
+    // Инициализация хранилища
+    initializeNvs();
+    
+    // Создаем буфер для отрисовки
+    Disbuff = new M5Canvas(&M5.Lcd);
+    Disbuff->createSprite(M5.Lcd.width(), M5.Lcd.height());
+    
+    // Запускаем BLE
+    NimBLEDevice::init("M5Locker");
+    
+    // Восстанавливаем состояние блокировки при запуске
+    currentState = loadGlobalLockState() ? LOCKED : NORMAL;
     
     Serial.begin(115200);
     delay(100);
@@ -2051,16 +1792,16 @@ void loop() {
     }
     
     // Проверяем, не пора ли выключить временно включенный экран
-    checkTemporaryScreen();
+    powerManager->checkTemporaryScreen();
     
     // Проверяем питание и яркость каждые 500мс
     if (millis() - lastVoltageCheck >= 500) {
         lastVoltageCheck = millis();
-        updatePowerStatus();  // Обновляем данные о питании
+        powerManager->updatePowerStatus();  // Обновляем данные о питании
         
         // Регулируем яркость в зависимости от питания
-        esp_power_level_t currentPower = (esp_power_level_t)NimBLEDevice::getPower();
-        adjustBrightness(currentPower);
+        PowerLevel currentPower = (PowerLevel)NimBLEDevice::getPower();
+        powerManager->adjustBrightness(currentPower);
     }
     
     // Проверка подключения
@@ -2634,82 +2375,6 @@ void clearAllPreferences() {
 } 
 
 // Добавляем функции для работы с RSSI
-RssiMeasurement getMeasuredRssi() {
-    RssiMeasurement measurement = {0, millis(), false};
-    
-    if (serialOutputEnabled) {
-        Serial.println("\n=== RSSI Measurement Start ===");
-    }
-    
-    // Метод 1: Через активное сканирование
-    if (pScan) {
-        if (serialOutputEnabled) Serial.println("Trying scan method...");
-        NimBLEScanResults results = pScan->getResults();
-        if (serialOutputEnabled) Serial.printf("Found devices: %d\n", results.getCount());
-        
-        for (int i = 0; i < results.getCount(); i++) {
-            const NimBLEAdvertisedDevice* device = results.getDevice(i);
-            if (device->getAddress().toString() == connectedDeviceAddress) {
-                int rssi = device->getRSSI();
-                if (serialOutputEnabled) {
-                    Serial.printf("Device found, RSSI: %d\n", rssi);
-                }
-                if (rssi != 0 && rssi < 0) {
-                    measurement.value = rssi;
-                    measurement.isValid = true;
-                    if (serialOutputEnabled) {
-                        Serial.println("✓ Valid RSSI from scan");
-                    }
-                    return measurement;
-                }
-            }
-        }
-        if (serialOutputEnabled) Serial.println("✗ Scan method failed");
-    }
-
-    // Метод 2: Через колбэк сервера
-    if (serialOutputEnabled) Serial.printf("Trying callback method, last RSSI: %d\n", lastAverageRssi);
-    if (lastAverageRssi != 0 && lastAverageRssi < 0) {
-        measurement.value = lastAverageRssi;
-        measurement.isValid = true;
-        if (serialOutputEnabled) {
-            Serial.println("✓ Valid RSSI from callback");
-        }
-        return measurement;
-    }
-    if (serialOutputEnabled) Serial.println("✗ Callback method failed");
-
-    // Метод 3: Через подключенное устройство
-    if (bleServer && bleServer->getConnectedCount() > 0) {
-        if (serialOutputEnabled) Serial.println("Trying client method...");
-        NimBLEClient* pClient = NimBLEDevice::createClient();
-        if (pClient) {
-            int rssi = pClient->getRssi();
-            if (serialOutputEnabled) {
-                Serial.printf("Client RSSI: %d\n", rssi);
-            }
-            if (rssi != 0 && rssi < 0) {
-                measurement.value = rssi;
-                measurement.isValid = true;
-                if (serialOutputEnabled) {
-                    Serial.println("✓ Valid RSSI from client");
-                }
-            }
-            NimBLEDevice::deleteClient(pClient);
-            if (measurement.isValid) {
-                return measurement;
-            }
-        }
-        if (serialOutputEnabled) Serial.println("✗ Client method failed");
-    }
-
-    if (serialOutputEnabled) {
-        Serial.println("✗ No valid RSSI measurement obtained");
-        Serial.println("=== RSSI Measurement End ===\n");
-    }
-    return measurement;
-}
-
 void addRssiMeasurement(const RssiMeasurement& measurement) {
     if (!measurement.isValid) return;
     
@@ -2772,46 +2437,12 @@ bool isRssiStable() {
 
 // Функция для временного включения экрана на среднюю яркость
 void temporaryScreenOn() {
-    // Включаем экран на среднюю яркость
-    M5.Display.setBrightness(BRIGHTNESS_MEDIUM);
-    screenOnTime = millis();
-    screenTemporaryOn = true;
-    
-    if (serialOutputEnabled) {
-        Serial.println("Screen temporarily turned on for 10 seconds");
-        Serial.printf("Screen on time set to: %lu\n", screenOnTime);
-    }
+    powerManager->temporaryScreenOn();
 }
 
 // Функция для проверки и выключения временно включенного экрана
 void checkTemporaryScreen() {
-    // Если экран был временно включен и прошло 10 секунд
-    if (screenTemporaryOn && (millis() - screenOnTime >= 10000)) {
-        if (serialOutputEnabled) {
-            Serial.printf("Screen timeout check: current=%lu, on_time=%lu, diff=%lu\n", 
-                millis(), screenOnTime, millis() - screenOnTime);
-        }
-        
-        screenTemporaryOn = false;
-        
-        // Возвращаем яркость в зависимости от текущего состояния
-        esp_power_level_t currentPower = (esp_power_level_t)NimBLEDevice::getPower();
-        
-        // Принудительно устанавливаем яркость в зависимости от питания
-        if (isUSBConnected()) {
-            M5.Display.setBrightness(BRIGHTNESS_USB);
-            if (serialOutputEnabled) {
-                Serial.printf("Forced brightness to USB level: %d\n", BRIGHTNESS_USB);
-            }
-        } else {
-            // Используем adjustBrightness для установки яркости в зависимости от мощности передатчика
-            adjustBrightness(currentPower);
-        }
-        
-        if (serialOutputEnabled) {
-            Serial.println("Temporary screen timeout - returning to normal brightness");
-        }
-    }
+    powerManager->checkTemporaryScreen();
 }
 
 // Функция для получения пароля устройства из NVS
@@ -2902,49 +2533,10 @@ void updateCurrentShortKey(const char* deviceAddress) {
 }
 
 // Глобальный экземпляр колбэков сканирования
-// static MyScanCallbacks* scanCallbacks = new MyScanCallbacks(); // <-- Comment out this line temporarily
+// static MyScanCallbacks* scanCallbacks = new MyScanCallbacks(); // Удаляем дублирующее объявление
 
 // Инициализация BLE
 void initBLE() {
     NimBLEDevice::init("");
     // ... existing code ...
-}
-
-void clearOldPasswords() {
-    Serial.println("\n=== Clearing old passwords ===");
-    
-    nvs_handle_t localNvsHandle;
-    esp_err_t err = nvs_open("m5kb_v1", NVS_READWRITE, &localNvsHandle);
-    if (err != ESP_OK) {
-        Serial.printf("Error opening NVS: %d\n", err);
-        return;
-    }
-    
-    // Получаем список всех ключей
-    nvs_iterator_t it = nvs_entry_find("nvs", "m5kb_v1", NVS_TYPE_STR);
-    while (it != NULL) {
-        nvs_entry_info_t info;
-        nvs_entry_info(it, &info);
-        String key = String(info.key);
-        
-        // Проверяем только ключи паролей
-        if (key.startsWith("pwd_")) {
-            String shortKey = key.substring(4); // Убираем "pwd_"
-            
-            // Если длина ключа больше 6 символов, это старый формат
-            if (shortKey.length() > 6) {
-                Serial.printf("Removing old key: %s\n", key.c_str());
-                nvs_erase_key(localNvsHandle, key.c_str());
-                nvs_erase_key(localNvsHandle, ("unlock_" + shortKey).c_str());
-                nvs_erase_key(localNvsHandle, ("lock_" + shortKey).c_str());
-            }
-        }
-        it = nvs_entry_next(it);
-    }
-    nvs_release_iterator(it);
-    
-    nvs_commit(localNvsHandle);
-    nvs_close(localNvsHandle);
-    
-    Serial.println("=== Old passwords cleared ===\n");
 }
