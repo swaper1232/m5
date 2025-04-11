@@ -3,7 +3,8 @@
 #include <NimBLEServer.h>
 
 class ServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* pServer) override;
-    void onDisconnect(NimBLEServer* pServer) override;
-    void onRssiUpdate(NimBLEServer* pServer, int rssi) override;
+public:
+    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override;
+    void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override;
+    void onMtuChanged(uint16_t MTU, NimBLEConnInfo& connInfo) override;
 }; 

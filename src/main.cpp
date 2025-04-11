@@ -204,18 +204,20 @@ void setup() {
     
     // Создаем HID устройство
     hid = new NimBLEHIDDevice(bleServer);
-    input = hid->inputReport(1);
-    output = hid->outputReport(1);
+    input = hid->getInputReport(1);
+    output = hid->getOutputReport(1);
     
     // Запускаем сервер
     bleServer->start();
-    hid->manufacturer()->setValue("M5Stack");
-    hid->pnp(0x02, 0xe502, 0xa111, 0x0210);
-    hid->hidInfo(0x00, 0x02);
+    hid->setManufacturer("M5Stack");
+    hid->setVendorId(0xe502);
+    hid->setProductId(0xa111);
+    hid->setVersion(0x0210);
+    hid->setHidInfo(0x00, 0x02);
     
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->setAppearance(HID_KEYBOARD);
-    pAdvertising->addServiceUUID(hid->hidService()->getUUID());
+    pAdvertising->addServiceUUID(hid->getHidService()->getUUID());
     pAdvertising->start();
     
     // Инициализация дисплея
