@@ -12,16 +12,10 @@
 #include <nvs.h>
 #include "device/DeviceLockState.h"
 #include "device/DeviceSettings.h"
+#include "device/ServerCallbacks.h"
 #include "rssi/RSSIManager.h"
 
 #define NVS_NAMESPACE "m5kb_v1"
-
-struct DeviceSettings {
-    int unlockRssi;     // Минимальный RSSI для разблокировки
-    int lockRssi;       // RSSI для блокировки
-    String password;    // Пароль (зашифрованный)
-    bool isLocked;      // Статус блокировки конкретного устройства
-};
 
 // Глобальные переменные и определения
 extern nvs_handle_t nvsHandle;
@@ -180,4 +174,84 @@ void updateDisplay() {
     }
     
     Disbuff->setTextColor(WHITE);
+}
+
+void setup() {
+    auto cfg = M5.config();
+    M5.begin(cfg);
+    
+    // Инициализация NVS
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    
+    // Настройка дисплея
+    M5.Display.setRotation(3);
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setTextSize(2);
+    
+    // Инициализация BLE
+    NimBLEDevice::init("M5BLELocker");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    
+    // Создаем сервер
+    bleServer = NimBLEDevice::createServer();
+    bleServer->setCallbacks(new ServerCallbacks());
+    
+    // Создаем HID устройство
+    hid = new NimBLEHIDDevice(bleServer);
+    input = hid->inputReport(1);
+    output = hid->outputReport(1);
+    
+    // Запускаем сервер
+    bleServer->start();
+    hid->manufacturer()->setValue("M5Stack");
+    hid->pnp(0x02, 0xe502, 0xa111, 0x0210);
+    hid->hidInfo(0x00, 0x02);
+    
+    NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+    pAdvertising->setAppearance(HID_KEYBOARD);
+    pAdvertising->addServiceUUID(hid->hidService()->getUUID());
+    pAdvertising->start();
+    
+    // Инициализация дисплея
+    Disbuff = new M5Canvas(&M5.Display);
+    Disbuff->createSprite(M5.Display.width(), M5.Display.height());
+    Disbuff->fillSprite(BLACK);
+    Disbuff->setTextColor(WHITE);
+    
+    if (serialOutputEnabled) {
+        Serial.println("BLE HID устройство готово");
+        Serial.println("Ожидание подключения...");
+    }
+}
+
+void loop() {
+    M5.update();
+    
+    if (connected) {
+        // Проверяем необходимость блокировки
+        if (shouldLockComputer()) {
+            // Отправляем команду блокировки
+            uint8_t msg[] = {0x00};  // Команда блокировки
+            input->setValue(msg, sizeof(msg));
+            input->notify();
+            
+            currentState = LOCKED;
+            if (serialOutputEnabled) {
+                Serial.println("Компьютер заблокирован");
+            }
+        }
+        
+        // Обновляем дисплей
+        Disbuff->fillSprite(BLACK);
+        updateDisplay();
+        Disbuff->pushSprite(0, 0);
+    }
+    
+    delay(100);  // Небольшая задержка для стабильности
 } 
