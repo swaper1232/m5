@@ -1,4 +1,5 @@
 #include "DeviceSettingsUtils.h"
+#include "NvsUtils.h"
 #include <Arduino.h> // Для String, toupper
 
 // Анонимное пространство имен для внутренних констант и переменных
@@ -112,5 +113,47 @@ String decryptPassword(const String& encrypted) {
     return decrypted;
 }
 
-// Сюда будем добавлять реализации других функций 
-// Сюда будем добавлять реализации других функций 
+// Сюда будем добавлять реализации других функций
+
+/*
+ * Новая реализация функции getDevicePasswordFromNVS без использования переменной serialOutputEnabled.
+ */
+String getDevicePasswordFromNVS(const String& shortKey) {
+    if (shortKey.length() == 0) {
+        return "";
+    }
+
+    nvs_handle_t nvsHandle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvsHandle);
+    if (err != ESP_OK) {
+        return "";
+    }
+
+    String passwordKey = "pwd_" + shortKey;
+    size_t required_size = 0;
+    err = nvs_get_str(nvsHandle, passwordKey.c_str(), NULL, &required_size);
+    if (err != ESP_OK) {
+        nvs_close(nvsHandle);
+        return "";
+    }
+
+    char* buffer = (char*)malloc(required_size);
+    if (buffer == NULL) {
+        nvs_close(nvsHandle);
+        return "";
+    }
+
+    err = nvs_get_str(nvsHandle, passwordKey.c_str(), buffer, &required_size);
+    if (err != ESP_OK) {
+        free(buffer);
+        nvs_close(nvsHandle);
+        return "";
+    }
+
+    String encryptedPassword = String(buffer);
+    free(buffer);
+    nvs_close(nvsHandle);
+
+    String password = decryptPassword(encryptedPassword);
+    return password;
+} 

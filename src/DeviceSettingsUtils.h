@@ -42,4 +42,12 @@ String encryptPassword(const String& password);
  */
 String decryptPassword(const String& encrypted);
 
+/**
+ * @brief Извлекает и дешифрует пароль устройства из NVS, используя его короткий ключ.
+ * 
+ * @param shortKey Короткий ключ устройства.
+ * @return String Дешифрованный пароль.
+ */
+String getDevicePasswordFromNVS(const String& shortKey);
+
 // Сюда будем добавлять объявления других функций по мере переноса 

@@ -1,1 +1,0 @@
-content = open("src/main.cpp", "r", encoding="utf8").read(); lines = content.split("\n"); start = 3249; end = 3269; for i in range(start-1, end-1): lines[i] = "// " + lines[i]; open("src/main.cpp", "w", encoding="utf8").write("\n".join(lines))
