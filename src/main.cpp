@@ -11,6 +11,12 @@
 #include "device_utils.h" // Добавляем для функции getShortKey
 #include "password_manager.h"
 
+// Глобальные определения для длительного нажатия кнопки A
+static unsigned long btnAPressStart = 0;
+#ifndef LONG_PRESS_DURATION
+#define LONG_PRESS_DURATION 2000
+#endif
+
 // Добавляем эти строки сразу после включений
 #define RSSI_HISTORY_SIZE 10
 
@@ -58,6 +64,10 @@ static const int RSSI_FAR_THRESHOLD = -65;
 // Добавляем константы для RSSI по умолчанию
 #define DEFAULT_LOCK_RSSI -60    // Порог RSSI для блокировки по умолчанию
 #define DEFAULT_UNLOCK_RSSI -45  // Порог RSSI для разблокировки по умолчанию
+
+// Динамические пороги, могут обновляться при длительном нажатии кнопки A
+static int dynamicLockThreshold = DEFAULT_LOCK_RSSI;
+static int dynamicUnlockThreshold = DEFAULT_UNLOCK_RSSI;
 
 // Добавляем глобальную переменную для управления отладочным выводом
 static bool serialOutputEnabled = true;
@@ -194,8 +204,8 @@ void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& setti
 
 DeviceSettings getDeviceSettings(const String& deviceAddress) {
     DeviceSettings settings;
-    settings.unlockRssi = RSSI_NEAR_THRESHOLD;
-    settings.lockRssi = RSSI_FAR_THRESHOLD;
+    settings.unlockRssi = DEFAULT_UNLOCK_RSSI;
+    settings.lockRssi = DEFAULT_LOCK_RSSI;
     
     String shortKey = cleanMacAddress(deviceAddress.c_str()); // Восстанавливаем вызов
     
@@ -327,29 +337,38 @@ static int lastMovementCount = 0;  // Счетчик для отслеживан
 
 // Добавим функцию для обновления экрана
 void updateDisplay() {
+    // При удержании кнопки A дольше LONG_PRESS_DURATION показываем сообщение и выходим
+    if (M5.BtnA.isPressed() && btnAPressStart != 0 && (millis() - btnAPressStart) >= LONG_PRESS_DURATION) {
+        Disbuff->fillSprite(BLACK);
+        Disbuff->setTextColor(GREEN);
+        Disbuff->setCursor(5, 60);
+        Disbuff->print("RSSI thresholds set");
+        Disbuff->pushSprite(0, 0);
+        return;
+    }
     int8_t isLocked = 0;
     nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &isLocked);
     
     Disbuff->fillSprite(BLACK);
-    Disbuff->setTextSize(2);
+    Disbuff->setTextSize(1);
     
-    // BLE статус (5px)
+    // BLE статус
     Disbuff->setTextColor(connected ? GREEN : RED);
-    Disbuff->setCursor(5, 5);
+    Disbuff->setCursor(5, 0);
     Disbuff->printf("BLE:%s", connected ? "OK" : "NO");
     
     if (connected) {
-        // RSSI (20px)
+        // RSSI
         Disbuff->setTextColor(WHITE);
-        Disbuff->setCursor(5, 20);
+        Disbuff->setCursor(5, 12);
         Disbuff->printf("RS:%d", lastAverageRssi);
         
-        // Среднее RSSI (35px)
-        Disbuff->setCursor(5, 35);
+        // Среднее RSSI
+        Disbuff->setCursor(5, 24);
         Disbuff->printf("AV:%d", lastAverageRssi);
         
-        // Состояние (50px)
-        Disbuff->setCursor(5, 50);
+        // Состояние
+        Disbuff->setCursor(5, 36);
         Disbuff->printf("ST:");
         switch (currentState) {
             case NORMAL: 
@@ -373,13 +392,13 @@ void updateDisplay() {
         
         // Счетчик движения (65px)
         if (currentState == MOVING_AWAY) {
-            Disbuff->setCursor(5, 65);
+            Disbuff->setCursor(5, 48);
             Disbuff->setTextColor(YELLOW);
             Disbuff->printf("CNT:%d/%d", lastMovementCount, MOVEMENT_SAMPLES);
         }
         
         // Разница RSSI (80px)
-        Disbuff->setCursor(5, 80);
+        Disbuff->setCursor(5, 60);
         Disbuff->setTextColor(WHITE);
         static int lastRssiDiff = 0;
         static int previousRssi = 0;
@@ -399,7 +418,7 @@ void updateDisplay() {
         }
         
         // Уровень сигнала (95px)
-        Disbuff->setCursor(5, 95);
+        Disbuff->setCursor(5, 72);
         if (lastAverageRssi > -50) {
             Disbuff->setTextColor(GREEN);
             Disbuff->print("SIG:HIGH");
@@ -416,8 +435,16 @@ void updateDisplay() {
             }
         }
         
+        // Динамические пороги (lock/unlock)
+        Disbuff->setTextSize(1);
+        Disbuff->setTextColor(WHITE);
+        Disbuff->setCursor(5, 84);
+        Disbuff->printf("L:%d  U:%d", dynamicLockThreshold, dynamicUnlockThreshold);
+        Disbuff->setTextSize(1);
+        
         // Пароль (110px)
-        Disbuff->setCursor(5, 110);
+        Disbuff->setCursor(5, 96);
+        Disbuff->setTextSize(1);
         if (getPasswordForDevice(connectedDeviceAddress.c_str()).length() > 0) {
             Disbuff->setTextColor(GREEN);
             Disbuff->print("PWD:OK");
@@ -457,7 +484,17 @@ public:
             if (bleServer && !connected) {
                 connectedDeviceAddress = targetDevice->getAddress().toString();
                 connected = true;
-            updateDisplay();
+                // Загружаем сохранённые пороги для этого устройства
+                {
+                    DeviceSettings ds = getDeviceSettings(connectedDeviceAddress.c_str());
+                    dynamicLockThreshold = ds.lockRssi;
+                    dynamicUnlockThreshold = ds.unlockRssi;
+                    if (serialOutputEnabled) {
+                        Serial.printf("Scan loaded thresholds: lock=%d, unlock=%d\n", 
+                            dynamicLockThreshold, dynamicUnlockThreshold);
+                    }
+                }
+                updateDisplay();
             }
         }
     }
@@ -543,7 +580,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         }
         
         // Сохраняем адрес устройства
-        esp_err_t err = nvs_set_str(nvsHandle, "last_device", connectedDeviceAddress.c_str());
+        esp_err_t err = nvs_set_str(nvsHandle, KEY_LAST_ADDR, connectedDeviceAddress.c_str());
         if (err != ESP_OK) {
             if (serialOutputEnabled) {
                 Serial.printf("Error saving device address: %d\n", err);
@@ -605,7 +642,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             
             if (serialOutputEnabled) {
                 Serial.printf("Current RSSI: %d, unlock threshold: %d\n", 
-                    lastAverageRssi, RSSI_NEAR_THRESHOLD);
+                    lastAverageRssi, dynamicUnlockThreshold);
                 Serial.println("Will monitor signal strength and unlock when stable.");
             }
             
@@ -619,6 +656,16 @@ class ServerCallbacks : public NimBLEServerCallbacks {
              if (nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &lockedCheckValue) == ESP_OK && lockedCheckValue != 0) {
                  saveGlobalLockState(false); // Теперь должно быть видно
              }
+        }
+        // Загружаем сохраненные пороги для этого устройства и применяем их
+        {
+            DeviceSettings devSettings = getDeviceSettings(connectedDeviceAddress.c_str());
+            dynamicLockThreshold = devSettings.lockRssi;
+            dynamicUnlockThreshold = devSettings.unlockRssi;
+            if (serialOutputEnabled) {
+                Serial.printf("Loaded thresholds: lock=%d, unlock=%d\n",
+                    dynamicLockThreshold, dynamicUnlockThreshold);
+            }
         }
     }
 
@@ -1119,8 +1166,8 @@ void setPasswordFromSerial() {
     
     // Устанавливаем пороги RSSI относительно текущего уровня
     int baseRssi = lastAverageRssi;
-    settings.unlockRssi = baseRssi - 10;
-    settings.lockRssi = baseRssi - 25;
+    settings.unlockRssi = baseRssi + 10;
+    settings.lockRssi = baseRssi - 10;
     
     // Проверяем длину пароля перед сохранением
     if (serialOutputEnabled) {
@@ -1139,9 +1186,17 @@ void setPasswordFromSerial() {
     
     Serial.println("Password and RSSI thresholds saved:");
     Serial.printf("Base RSSI     : %d (current position)\n", baseRssi);
-    Serial.printf("Unlock RSSI   : %d (-10 from base)\n", settings.unlockRssi);
-    Serial.printf("Lock RSSI     : %d (-25 from base)\n", settings.lockRssi);
+    Serial.printf("Unlock RSSI   : %d (+10 from base)\n", settings.unlockRssi);
+    Serial.printf("Lock RSSI     : %d (-10 from base)\n", settings.lockRssi);
     Serial.printf("Critical level: %d (-35 from base)\n", baseRssi - 35);
+    
+    // Обновляем динамические пороги после установки пароля и RSSI порогов
+    dynamicLockThreshold = settings.lockRssi;
+    dynamicUnlockThreshold = settings.unlockRssi;
+    if (serialOutputEnabled) {
+        Serial.printf("Dynamic thresholds updated via setpwd: lock=%d, unlock=%d\n",
+            dynamicLockThreshold, dynamicUnlockThreshold);
+    }
 }
 
 // Добавим функцию для эхо ввода
@@ -1865,7 +1920,17 @@ void adjustTransmitPower(DeviceState state, int rssi) {
 
 void initStorage() {
     Serial.println("Initializing storage...");
-    esp_err_t err = nvs_open("m5kb_v1", NVS_READWRITE, &nvsHandle);
+    // Инициализация NVS Flash
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) {
+        Serial.printf("Error init NVS flash: %d\n", err);
+    }
+    // Открываем NVS namespace
+    err = nvs_open("m5kb_v1", NVS_READWRITE, &nvsHandle);
     if (err != ESP_OK) {
         Serial.printf("Error opening NVS handle: %d\n", err);
         return;
@@ -1883,6 +1948,21 @@ void initStorage() {
     }
     
     Serial.println("Storage initialized successfully");
+    // Загружаем пороги для последнего устройства при инициализации NVS
+    {
+        char lastDev[32] = {0};
+        size_t len = sizeof(lastDev);
+        if (nvs_get_str(nvsHandle, KEY_LAST_ADDR, lastDev, &len) == ESP_OK && strlen(lastDev) > 0) {
+            String lastAddr = String(lastDev);
+            DeviceSettings ds = getDeviceSettings(lastAddr);
+            dynamicLockThreshold = ds.lockRssi;
+            dynamicUnlockThreshold = ds.unlockRssi;
+            if (serialOutputEnabled) {
+                Serial.printf("initStorage loaded thresholds for %s: lock=%d, unlock=%d\n",
+                    lastAddr.c_str(), dynamicLockThreshold, dynamicUnlockThreshold);
+            }
+        }
+    }
 }
 
 void checkLockState() {
@@ -1922,12 +2002,12 @@ void setup() {
     M5.Display.setRotation(3);
     Disbuff = new M5Canvas(&M5.Display);
     Disbuff->createSprite(M5.Display.width(), M5.Display.height());
-    Disbuff->setTextSize(2);
+    Disbuff->setTextSize(1);
     
     Serial.println("=== Initial NVS Setup ===");
     
     // Инициализируем NVS
-    initializeNvs(); // Вызываем нашу функцию
+    initStorage(); // Вызываем нашу функцию
     
     // Восстанавливаем проверку кнопки для очистки NVS
     bool clearNVS = false;  // По умолчанию не очищаем
@@ -1947,8 +2027,8 @@ void setup() {
         nvs_flash_erase();
         nvs_flash_init();
         
-        // Переоткрываем NVS handle после очистки, initializeNvs сделает это
-        initializeNvs(); 
+        // Переоткрываем NVS handle после очистки
+        initStorage(); 
     }
     
     // Перезапускаем BLE стек
@@ -2000,6 +2080,23 @@ void setup() {
     pScan->setDuplicateFilter(false);
 
     Serial.println("Setup complete");
+
+    // Загружаем пороги для последнего устройства, если оно было спарено
+    {
+        char lastDev[32] = {0};
+        size_t len = sizeof(lastDev);
+        if (nvs_get_str(nvsHandle, KEY_LAST_ADDR, lastDev, &len) == ESP_OK && strlen(lastDev) > 0) {
+            String lastAddr = String(lastDev);
+            DeviceSettings ds = getDeviceSettings(lastAddr);
+            dynamicLockThreshold = ds.lockRssi;
+            dynamicUnlockThreshold = ds.unlockRssi;
+            if (serialOutputEnabled) {
+                Serial.printf("Setup loaded thresholds for %s: lock=%d, unlock=%d\n",
+                    lastAddr.c_str(), dynamicLockThreshold, dynamicUnlockThreshold);
+            }
+        }
+    }
+    // Перезапускаем BLE стек
 }
 
 void loop() {
@@ -2015,11 +2112,55 @@ void loop() {
     M5.update();
     
     // Обработка нажатий кнопок
-    if (M5.BtnA.wasPressed()) {
-        if (serialOutputEnabled) {
-            Serial.println("Button A pressed - turning screen on temporarily");
+    if (M5.BtnA.isPressed()) {
+        if (btnAPressStart == 0) {
+            btnAPressStart = millis();
         }
-        temporaryScreenOn();
+    } else {
+        if (btnAPressStart != 0) {
+            unsigned long pressDuration = millis() - btnAPressStart;
+            if (pressDuration >= LONG_PRESS_DURATION) {
+                // Длительное нажатие: если сигнал достаточно слабый (устройство удалено), обновляем уровни
+                if (lastAverageRssi <= -70) {
+                    DeviceSettings settings = getDeviceSettings(connectedDeviceAddress.c_str());
+                    int baseRssi = lastAverageRssi;
+                    settings.unlockRssi = baseRssi + 10;
+                    settings.lockRssi = baseRssi - 10;
+                    saveDeviceSettings(connectedDeviceAddress.c_str(), settings);
+                    Serial.println("Thresholds updated via long press on button A");
+                    // Показываем сообщение на экране, пока кнопка A удерживается
+                    while (M5.BtnA.isPressed()) {
+                        Disbuff->fillSprite(BLACK);
+                        Disbuff->setTextColor(GREEN);
+                        Disbuff->setCursor(5, 60);
+                        Disbuff->print("RSSI thresholds set");
+                        Disbuff->pushSprite(0, 0);
+                        delay(100);
+                        M5.update();
+                    }
+                    // Обновляем динамические пороги
+                    dynamicLockThreshold = settings.lockRssi;
+                    dynamicUnlockThreshold = settings.unlockRssi;
+                    if (serialOutputEnabled) {
+                        Serial.printf("Dynamic thresholds updated via long press: lock=%d, unlock=%d\n",
+                            dynamicLockThreshold, dynamicUnlockThreshold);
+                    }
+                    // Сохраняем адрес устройства и commit, чтобы thresholds применялись после перезагрузки
+                    if (!connectedDeviceAddress.empty()) {
+                        esp_err_t errAddr = nvs_set_str(nvsHandle, KEY_LAST_ADDR, connectedDeviceAddress.c_str());
+                        if (errAddr == ESP_OK) {
+                            nvs_commit(nvsHandle);
+                        }
+                    }
+                } else {
+                    Serial.println("Not far enough to update thresholds");
+                }
+            } else {
+                // Короткое нажатие: временное включение экрана
+                temporaryScreenOn();
+            }
+            btnAPressStart = 0;
+        }
     }
     
     if (M5.BtnB.wasPressed()) {
@@ -2263,8 +2404,8 @@ void loop() {
                 currentState == MOVING_AWAY ? "MOVING_AWAY" : 
                 currentState == LOCKED ? "LOCKED" : "APPROACHING");
             Serial.printf("Current RSSI: %d dBm (filtered)\n", lastAverageRssi);
-            Serial.printf("Lock threshold: %d dBm\n", RSSI_LOCK_THRESHOLD);
-            Serial.printf("Unlock threshold: %d dBm\n", RSSI_NEAR_THRESHOLD);
+            Serial.printf("Lock threshold: %d dBm\n", dynamicLockThreshold);
+            Serial.printf("Unlock threshold: %d dBm\n", dynamicUnlockThreshold);
             Serial.printf("Consecutive lock samples: %d/%d\n", consecutiveLockSamples, CONSECUTIVE_SAMPLES_NEEDED);
             Serial.printf("Consecutive unlock samples: %d/%d\n", consecutiveUnlockSamples, CONSECUTIVE_SAMPLES_NEEDED);
             Serial.printf("Time since last state change: %lu ms\n", millis() - lastStateChangeTime);
@@ -2296,11 +2437,11 @@ void loop() {
                     consecutiveUnlockSamples = 0;
                 }
                 // Обычная логика блокировки при удалении
-                else if (lastAverageRssi < RSSI_LOCK_THRESHOLD) {
+                else if (lastAverageRssi < dynamicLockThreshold) {
                     consecutiveLockSamples++;
                     if (serialOutputEnabled) {
                         Serial.printf("Signal below lock threshold (%d < %d), sample %d/%d, stable=%s\n", 
-                            lastAverageRssi, RSSI_LOCK_THRESHOLD, consecutiveLockSamples, 
+                            lastAverageRssi, dynamicLockThreshold, consecutiveLockSamples, 
                             CONSECUTIVE_SAMPLES_NEEDED, stable ? "YES" : "NO");
                     }
                     
@@ -2323,7 +2464,7 @@ void loop() {
                     }
                 } else {
                     // Не сбрасываем счетчик полностью при небольших колебаниях сигнала
-                    if (lastAverageRssi > RSSI_LOCK_THRESHOLD + 5) {
+                    if (lastAverageRssi > dynamicLockThreshold + 5) {
                         // Сбрасываем счетчик только если сигнал значительно улучшился
                         consecutiveLockSamples = 0;
                     } else if (consecutiveLockSamples > 0) {
@@ -2336,11 +2477,11 @@ void loop() {
             // Логика разблокировки компьютера
     if (currentState == LOCKED) {
                 // Используем скользящее среднее для разблокировки, чтобы избежать ложных срабатываний
-                if (lastAverageRssi > RSSI_NEAR_THRESHOLD) {
+                if (lastAverageRssi > dynamicUnlockThreshold) {
                     consecutiveUnlockSamples++;
                     if (serialOutputEnabled) {
                         Serial.printf("Signal above unlock threshold (%d > %d), sample %d/%d, stable=%s\n", 
-                            lastAverageRssi, RSSI_NEAR_THRESHOLD, consecutiveUnlockSamples, 
+                            lastAverageRssi, dynamicUnlockThreshold, consecutiveUnlockSamples, 
                             CONSECUTIVE_SAMPLES_NEEDED, stable ? "YES" : "NO");
                     }
                     
@@ -2363,7 +2504,7 @@ void loop() {
                 } else {
                     // Не сбрасываем счетчик полностью при небольших колебаниях сигнала
                     // Это позволит разблокировать устройство даже при небольших колебаниях сигнала
-                    if (lastAverageRssi < RSSI_NEAR_THRESHOLD - 5) {
+                    if (lastAverageRssi < dynamicUnlockThreshold - 5) {
                         // Сбрасываем счетчик только если сигнал значительно ухудшился
                         consecutiveUnlockSamples = 0;
                     } else if (consecutiveUnlockSamples > 0) {
@@ -2915,3 +3056,7 @@ void initBLE() {
 
 // Функция clearOldPasswords была перенесена в модуль password_manager
 // Используйте clearOldPasswords() из password_manager.h
+
+#ifndef LONG_PRESS_DURATION
+#define LONG_PRESS_DURATION 2000
+#endif
