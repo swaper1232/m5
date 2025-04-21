@@ -10,6 +10,7 @@
 #include "DeviceSettingsUtils.h" // Добавляем include для нового модуля
 #include "device_utils.h" // Добавляем для функции getShortKey
 #include "password_manager.h"
+#include "DeviceLockUtils.h" // Добавляем для функций saveDeviceLockState/loadDeviceLockState
 
 // Глобальные определения для длительного нажатия кнопки A
 static unsigned long btnAPressStart = 0;
@@ -75,6 +76,7 @@ static bool serialOutputEnabled = true;
 // В начало файла после включения библиотек
 static const char* KEY_LAST_ADDR = "last_addr";
 static const char* KEY_PASSWORD = "password";  // Добавляем константу для пароля
+static const char* KEY_LOCK_STATE_PREFIX = "locked_";   // Префикс для ключей состояния блокировки по устройству
 
 // Добавляем прототип функции
 void lockComputer();
@@ -148,6 +150,7 @@ static const int MAX_STORED_PASSWORDS = 5;   // Максимум сохране�
 // Прототипы функций
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings);
 void addRssiMeasurement(const RssiMeasurement& measurement);
+void drawBatteryIndicator(int x, int y, int width, int height, float batteryLevel, bool isCharging);
 
 // Определения функций
 void saveDeviceSettings(const String& deviceAddress, const DeviceSettings& settings) {
@@ -349,6 +352,10 @@ void updateDisplay() {
     int8_t isLocked = 0;
     nvs_get_i8(nvsHandle, KEY_IS_LOCKED, &isLocked);
     
+    // Получаем текущие данные о батарее
+    float currentBatteryLevel = M5.Power.getBatteryLevel();
+    bool isCharging = M5.Power.isCharging();
+    
     Disbuff->fillSprite(BLACK);
     Disbuff->setTextSize(1);
     
@@ -452,9 +459,109 @@ void updateDisplay() {
             Disbuff->setTextColor(RED);
             Disbuff->print("PWD:NO");
         }
+        
+        // Индикатор заряда батареи (122px)
+        Disbuff->setCursor(5, 108);
+        Disbuff->setTextSize(1);
+        
+        // Устанавливаем цвет в зависимости от уровня заряда
+        uint16_t batteryColor;
+        if (currentBatteryLevel > 75) {
+            batteryColor = GREEN;
+        } else if (currentBatteryLevel > 25) {
+            batteryColor = YELLOW;
+        } else {
+            batteryColor = RED;
+        }
+        Disbuff->setTextColor(batteryColor);
+        
+        // Отображаем статус зарядки и уровень заряда
+        Disbuff->printf("BAT:%d%%%s", (int)currentBatteryLevel, isCharging ? "+" : "");
+        
+        // Отображаем графический индикатор заряда
+        drawBatteryIndicator(5, 120, 30, 10, currentBatteryLevel, isCharging);
+    } else {
+        // Если не подключены, показываем только статус батареи
+        Disbuff->setCursor(5, 108);
+        Disbuff->setTextSize(1);
+        
+        // Устанавливаем цвет в зависимости от уровня заряда
+        uint16_t batteryColor;
+        if (currentBatteryLevel > 75) {
+            batteryColor = GREEN;
+        } else if (currentBatteryLevel > 25) {
+            batteryColor = YELLOW;
+        } else {
+            batteryColor = RED;
+        }
+        Disbuff->setTextColor(batteryColor);
+        
+        // Отображаем статус зарядки и уровень заряда
+        Disbuff->printf("BAT:%d%%%s", (int)currentBatteryLevel, isCharging ? "+" : "");
+        
+        // Отображаем графический индикатор заряда
+        drawBatteryIndicator(5, 120, 30, 10, currentBatteryLevel, isCharging);
     }
     
     Disbuff->pushSprite(0, 0);
+}
+
+// Добавляем функцию отрисовки индикатора батареи
+void drawBatteryIndicator(int x, int y, int width, int height, float batteryLevel, bool isCharging) {
+    // Устанавливаем цвет в зависимости от уровня заряда
+    uint16_t batteryColor;
+    if (batteryLevel > 75) {
+        batteryColor = GREEN;
+    } else if (batteryLevel > 25) {
+        batteryColor = YELLOW;
+    } else {
+        batteryColor = RED;
+    }
+    
+    const int capWidth = 3;   // Ширина выступа батарейки
+    const int capHeight = 4;  // Высота выступа батарейки
+    
+    // Рисуем основную часть батарейки (прямоугольник)
+    Disbuff->drawRect(x, y, width, height, WHITE);
+    
+    // Рисуем выступ (положительный контакт) батарейки
+    Disbuff->fillRect(
+        x + width, 
+        y + (height - capHeight) / 2, 
+        capWidth, 
+        capHeight, 
+        WHITE
+    );
+    
+    // Вычисляем ширину заполненной части батарейки
+    int fillWidth = map((int)batteryLevel, 0, 100, 0, width - 2);
+    
+    // Заполняем внутреннюю часть батарейки
+    if (fillWidth > 0) {
+        Disbuff->fillRect(x + 1, y + 1, fillWidth, height - 2, batteryColor);
+        
+        // Рисуем деления внутри батарейки
+        if (width > 10) {
+            for (int i = 1; i < 5; i++) {
+                int lineX = x + i * (width / 5);
+                if (lineX < x + fillWidth) continue; // Не рисуем линии в заполненной части
+                Disbuff->drawLine(
+                    lineX, 
+                    y + 1, 
+                    lineX, 
+                    y + height - 2, 
+                    WHITE
+                );
+            }
+        }
+    }
+    
+    // Добавляем значок молнии если заряжается
+    if (isCharging) {
+        Disbuff->setTextColor(YELLOW);
+        Disbuff->setCursor(x + width + capWidth + 2, y);
+        Disbuff->print("+"); // Используем "+", т.к. символ молнии может не поддерживаться
+    }
 }
 
 // Сначала объявляем класс для колбэков сканирования
@@ -630,26 +737,26 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         }
         
         // Проверяем, было ли устройство заблокировано
-        bool wasLocked = loadGlobalLockState(); // Теперь должно быть видно
+        bool wasLocked = loadDeviceLockState(connectedDeviceAddress.c_str()); // Проверяем состояние блокировки для этого устройства
         if (wasLocked) {
-            if (serialOutputEnabled) {
-                Serial.println("Device was locked before reconnection.");
-            }
-            
-            // Устанавливаем состояние LOCKED, но не разблокируем сразу
-            // Разблокировка произойдет автоматически в loop() после проверки стабильности сигнала
+            // Устанавливаем состояние LOCKED
             currentState = LOCKED;
-            
-            if (serialOutputEnabled) {
-                Serial.printf("Current RSSI: %d, unlock threshold: %d\n", 
-                    lastAverageRssi, dynamicUnlockThreshold);
-                Serial.println("Will monitor signal strength and unlock when stable.");
-            }
-            
-            // Сбрасываем счетчики и время последнего изменения состояния
+            lastStateChangeTime = millis() - STATE_CHANGE_DELAY / 2;
             consecutiveLockSamples = 0;
             consecutiveUnlockSamples = 0;
-            lastStateChangeTime = millis() - STATE_CHANGE_DELAY / 2; // Уменьшаем задержку вдвое при переподключении
+            if (serialOutputEnabled) {
+                Serial.println("Device was locked before reconnection.");
+                Serial.printf("Current RSSI: %d, unlock threshold: %d\n", lastAverageRssi, dynamicUnlockThreshold);
+                Serial.println("Will monitor signal strength and unlock when stable.");
+            }
+            // Автоматически разблокируем, если уже рядом
+            if (lastAverageRssi > dynamicUnlockThreshold) {
+                if (serialOutputEnabled) {
+                    Serial.println("Auto-unlock on reconnect as device is in range");
+                }
+                unlockComputer();
+                currentState = NORMAL;
+            }
         } else {
             // Убедимся, что состояние точно 0, если ключ был найден, но значение было не 1
              int8_t lockedCheckValue; // Используем временную переменную
@@ -2065,10 +2172,21 @@ void setup() {
 
     Serial.println("Advertising started...");
 
-    // Восстанавливаем состояние блокировки при запуске
-    currentState = loadGlobalLockState() ? LOCKED : NORMAL;
-    if (currentState == LOCKED && serialOutputEnabled) {
-        Serial.println("Restored state: LOCKED");
+    // Восстанавливаем состояние блокировки при запуске по последнему устройству
+    {
+        char lastAddrBuf[32] = {0};
+        size_t lastLen = sizeof(lastAddrBuf);
+        if (nvs_get_str(nvsHandle, KEY_LAST_ADDR, lastAddrBuf, &lastLen) == ESP_OK
+            && strlen(lastAddrBuf) > 0) {
+            String lastAddr = String(lastAddrBuf);
+            bool wasLocked = loadDeviceLockState(lastAddr);
+            currentState = wasLocked ? LOCKED : NORMAL;
+            if (wasLocked && serialOutputEnabled) {
+                Serial.printf("Restored lock state for %s: LOCKED\n", lastAddr.c_str());
+            }
+        } else {
+            currentState = NORMAL;
+        }
     }
 
     // Инициализация сканера
@@ -2554,7 +2672,7 @@ void lockComputer() {
     
     if (success) {
         // Сохраняем состояние блокировки и адрес устройства
-        saveGlobalLockState(true); // Используем новую функцию
+        saveDeviceLockState(connectedDeviceAddress.c_str(), true); // Сохраняем блокировку для текущего устройства
         Serial.println("Lock state saved to NVS");
     }
     
@@ -2674,7 +2792,7 @@ void unlockComputer() {
             typePassword(password);
             
             // 3. Сбрасываем состояние блокировки
-            saveGlobalLockState(false); // Используем новую функцию
+            saveDeviceLockState(connectedDeviceAddress.c_str(), false); // Сохраняем разблокировку для текущего устройства
             currentState = NORMAL;
             
             Serial.println("Computer unlocked successfully!");
@@ -3060,3 +3178,22 @@ void initBLE() {
 #ifndef LONG_PRESS_DURATION
 #define LONG_PRESS_DURATION 2000
 #endif
+
+// Сохраняет состояние блокировки для указанного устройства
+static void saveDeviceLockState(const String& deviceAddress, bool locked) {
+    String sk = cleanMacAddress(deviceAddress.c_str());
+    String key = String(KEY_LOCK_STATE_PREFIX) + sk;
+    nvs_set_i8(nvsHandle, key.c_str(), locked ? 1 : 0);
+    nvs_commit(nvsHandle);
+}
+
+// Загружает состояние блокировки для указанного устройства
+static bool loadDeviceLockState(const String& deviceAddress) {
+    String sk = cleanMacAddress(deviceAddress.c_str());
+    String key = String(KEY_LOCK_STATE_PREFIX) + sk;
+    int8_t flag = 0;
+    if (nvs_get_i8(nvsHandle, key.c_str(), &flag) == ESP_OK) {
+        return flag != 0;
+    }
+    return false;
+}
