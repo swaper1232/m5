@@ -621,6 +621,7 @@ static MyScanCallbacks* scanCallbacks = new MyScanCallbacks();
 
 // Добавляем предварительное объявление для adjustBrightness
 void adjustBrightness(esp_power_level_t txPower);
+bool isUSBConnected();
 
 // Затем класс для колбэков сервера
 class ServerCallbacks : public NimBLEServerCallbacks {
@@ -885,21 +886,121 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // Функция для адаптивного управления мощностью
     void adjustTransmitPower(DeviceState state, int rssi) {
         esp_power_level_t newPower;
-
-        if (rssi > -35) {  // Очень близко
-            newPower = ESP_PWR_LVL_N12;  // Минимальная мощность
-        } else if (rssi > -45) {  // Близко
-            newPower = ESP_PWR_LVL_N9;
-        } else if (rssi > -55) {  // Средняя дистанция
-            newPower = ESP_PWR_LVL_N3;
-        } else if (rssi > -65) {  // Дальняя дистанция
-            newPower = ESP_PWR_LVL_P3;
-        } else {  // Очень далеко
-            newPower = ESP_PWR_LVL_P9;  // Максимальная мощность
+        static unsigned long lastPowerChangeTime = 0;
+        static esp_power_level_t lastPower = ESP_PWR_LVL_P9;
+        static bool isPowerGraduallyReducing = false;
+        
+        // Получаем настройки для подключенного устройства
+        DeviceSettings settings;
+        bool hasCustomSettings = false;
+        
+        if (connected && connectedDeviceAddress.length() > 0) {
+            settings = getDeviceSettings(connectedDeviceAddress.c_str());
+            hasCustomSettings = true;
         }
-
-        NimBLEDevice::setPower(newPower);
-        adjustBrightness(newPower);  // Регулируем яркость
+        
+        // Рассчитываем пороги RSSI на основе пользовательских настроек
+        int veryCloseThreshold = -35;  // По умолчанию
+        int closeThreshold = -45;
+        int mediumThreshold = -55;
+        int farThreshold = -65;
+        
+        if (hasCustomSettings) {
+            // Настраиваем пороги относительно значений lock/unlock
+            // Используем более щадящие пороги для обеспечения стабильной связи
+            int range = settings.unlockRssi - settings.lockRssi;
+            
+            if (range > 5) {
+                veryCloseThreshold = settings.unlockRssi;
+                closeThreshold = settings.unlockRssi - (range / 4);
+                mediumThreshold = settings.unlockRssi - (range / 2);
+                farThreshold = settings.lockRssi + 5; // Чуть лучше чем порог блокировки
+            }
+        }
+        
+        // Определяем базовую мощность на основе RSSI
+        esp_power_level_t basePower;
+        if (rssi > veryCloseThreshold) {
+            basePower = ESP_PWR_LVL_N9;  // Не используем самую низкую мощность N12 для надежности
+        } else if (rssi > closeThreshold) {
+            basePower = ESP_PWR_LVL_N6;
+        } else if (rssi > mediumThreshold) {
+            basePower = ESP_PWR_LVL_N3;
+        } else if (rssi > farThreshold) {
+            basePower = ESP_PWR_LVL_P3;
+        } else {
+            basePower = ESP_PWR_LVL_P9;  // Максимальная мощность
+        }
+        
+        // Если находимся в состоянии блокировки или удаления, нужно обеспечить надежный сигнал
+        if (state == MOVING_AWAY || state == LOCKED) {
+            // Для состояния MOVING_AWAY используем повышенную мощность
+            if (basePower < ESP_PWR_LVL_P3) {
+                basePower = ESP_PWR_LVL_P3;
+            }
+        }
+        
+        // Учитываем состояние зарядки
+        bool isUSB = isUSBConnected();
+        
+        if (!isUSB) {
+            // При работе от батареи постепенно снижаем мощность, не делая резких скачков
+            if (!isPowerGraduallyReducing && lastPower > basePower) {
+                isPowerGraduallyReducing = true;
+                lastPowerChangeTime = millis();
+            } else if (isPowerGraduallyReducing) {
+                // Проверяем, прошло ли достаточно времени для снижения мощности
+                unsigned long currentTime = millis();
+                if (currentTime - lastPowerChangeTime > 5000) { // 5 секунд между шагами снижения
+                    if (lastPower > basePower) {
+                        // Снижаем мощность на один шаг
+                        esp_power_level_t nextPower;
+                        switch (lastPower) {
+                            case ESP_PWR_LVL_P9: nextPower = ESP_PWR_LVL_P6; break;
+                            case ESP_PWR_LVL_P6: nextPower = ESP_PWR_LVL_P3; break;
+                            case ESP_PWR_LVL_P3: nextPower = ESP_PWR_LVL_N0; break;
+                            case ESP_PWR_LVL_N0: nextPower = ESP_PWR_LVL_N3; break;
+                            case ESP_PWR_LVL_N3: nextPower = ESP_PWR_LVL_N6; break;
+                            case ESP_PWR_LVL_N6: nextPower = ESP_PWR_LVL_N9; break;
+                            default: nextPower = basePower;
+                        }
+                        basePower = nextPower;
+                        lastPowerChangeTime = currentTime;
+                    } else {
+                        isPowerGraduallyReducing = false;
+                    }
+                } else {
+                    // Пока не прошло достаточно времени, используем предыдущую мощность
+                    basePower = lastPower;
+                }
+            }
+        } else {
+            // При работе от USB можем сразу использовать рассчитанную мощность
+            isPowerGraduallyReducing = false;
+        }
+        
+        // Применяем рассчитанную мощность
+        newPower = basePower;
+        
+        // Предотвращаем слишком низкую мощность при удалении
+        if (state == MOVING_AWAY && rssi < settings.lockRssi + 5) {
+            // Когда мы приближаемся к порогу блокировки, используем максимальную мощность
+            // чтобы гарантировать отправку команды блокировки
+            newPower = ESP_PWR_LVL_P9;
+        }
+        
+        // Применяем новую мощность, если она изменилась
+        if (newPower != lastPower) {
+            if (serialOutputEnabled) {
+                Serial.printf("Adjusting TX power: %d -> %d (RSSI: %d, State: %d, USB: %d)\n",
+                    lastPower, newPower, rssi, state, isUSB);
+            }
+            NimBLEDevice::setPower(newPower);
+            lastPower = newPower;
+        }
+        
+        // Регулируем яркость дисплея
+        adjustBrightness(newPower);
     }
 };
 
@@ -2005,21 +2106,121 @@ void adjustScanParameters(DeviceState state) {
 // Функция для адаптивного управления мощностью
 void adjustTransmitPower(DeviceState state, int rssi) {
     esp_power_level_t newPower;
+    static unsigned long lastPowerChangeTime = 0;
+    static esp_power_level_t lastPower = ESP_PWR_LVL_P9;
+    static bool isPowerGraduallyReducing = false;
     
-    if (rssi > -35) {  // Очень близко
-        newPower = ESP_PWR_LVL_N12;  // Минимальная мощность
-    } else if (rssi > -45) {  // Близко
-        newPower = ESP_PWR_LVL_N9;
-    } else if (rssi > -55) {  // Средняя дистанция
-        newPower = ESP_PWR_LVL_N3;
-    } else if (rssi > -65) {  // Дальняя дистанция
-        newPower = ESP_PWR_LVL_P3;
-    } else {  // Очень далеко
-        newPower = ESP_PWR_LVL_P9;  // Максимальная мощность
+    // Получаем настройки для подключенного устройства
+    DeviceSettings settings;
+    bool hasCustomSettings = false;
+    
+    if (connected && connectedDeviceAddress.length() > 0) {
+        settings = getDeviceSettings(connectedDeviceAddress.c_str());
+        hasCustomSettings = true;
     }
     
-    NimBLEDevice::setPower(newPower);
-    adjustBrightness(newPower);  // Регулируем яркость
+    // Рассчитываем пороги RSSI на основе пользовательских настроек
+    int veryCloseThreshold = -35;  // По умолчанию
+    int closeThreshold = -45;
+    int mediumThreshold = -55;
+    int farThreshold = -65;
+    
+    if (hasCustomSettings) {
+        // Настраиваем пороги относительно значений lock/unlock
+        // Используем более щадящие пороги для обеспечения стабильной связи
+        int range = settings.unlockRssi - settings.lockRssi;
+        
+        if (range > 5) {
+            veryCloseThreshold = settings.unlockRssi;
+            closeThreshold = settings.unlockRssi - (range / 4);
+            mediumThreshold = settings.unlockRssi - (range / 2);
+            farThreshold = settings.lockRssi + 5; // Чуть лучше чем порог блокировки
+        }
+    }
+    
+    // Определяем базовую мощность на основе RSSI
+    esp_power_level_t basePower;
+    if (rssi > veryCloseThreshold) {
+        basePower = ESP_PWR_LVL_N9;  // Не используем самую низкую мощность N12 для надежности
+    } else if (rssi > closeThreshold) {
+        basePower = ESP_PWR_LVL_N6;
+    } else if (rssi > mediumThreshold) {
+        basePower = ESP_PWR_LVL_N3;
+    } else if (rssi > farThreshold) {
+        basePower = ESP_PWR_LVL_P3;
+    } else {
+        basePower = ESP_PWR_LVL_P9;  // Максимальная мощность
+    }
+    
+    // Если находимся в состоянии блокировки или удаления, нужно обеспечить надежный сигнал
+    if (state == MOVING_AWAY || state == LOCKED) {
+        // Для состояния MOVING_AWAY используем повышенную мощность
+        if (basePower < ESP_PWR_LVL_P3) {
+            basePower = ESP_PWR_LVL_P3;
+        }
+    }
+    
+    // Учитываем состояние зарядки
+    bool isUSB = isUSBConnected();
+    
+    if (!isUSB) {
+        // При работе от батареи постепенно снижаем мощность, не делая резких скачков
+        if (!isPowerGraduallyReducing && lastPower > basePower) {
+            isPowerGraduallyReducing = true;
+            lastPowerChangeTime = millis();
+        } else if (isPowerGraduallyReducing) {
+            // Проверяем, прошло ли достаточно времени для снижения мощности
+            unsigned long currentTime = millis();
+            if (currentTime - lastPowerChangeTime > 5000) { // 5 секунд между шагами снижения
+                if (lastPower > basePower) {
+                    // Снижаем мощность на один шаг
+                    esp_power_level_t nextPower;
+                    switch (lastPower) {
+                        case ESP_PWR_LVL_P9: nextPower = ESP_PWR_LVL_P6; break;
+                        case ESP_PWR_LVL_P6: nextPower = ESP_PWR_LVL_P3; break;
+                        case ESP_PWR_LVL_P3: nextPower = ESP_PWR_LVL_N0; break;
+                        case ESP_PWR_LVL_N0: nextPower = ESP_PWR_LVL_N3; break;
+                        case ESP_PWR_LVL_N3: nextPower = ESP_PWR_LVL_N6; break;
+                        case ESP_PWR_LVL_N6: nextPower = ESP_PWR_LVL_N9; break;
+                        default: nextPower = basePower;
+                    }
+                    basePower = nextPower;
+                    lastPowerChangeTime = currentTime;
+                } else {
+                    isPowerGraduallyReducing = false;
+                }
+            } else {
+                // Пока не прошло достаточно времени, используем предыдущую мощность
+                basePower = lastPower;
+            }
+        }
+    } else {
+        // При работе от USB можем сразу использовать рассчитанную мощность
+        isPowerGraduallyReducing = false;
+    }
+    
+    // Применяем рассчитанную мощность
+    newPower = basePower;
+    
+    // Предотвращаем слишком низкую мощность при удалении
+    if (state == MOVING_AWAY && rssi < settings.lockRssi + 5) {
+        // Когда мы приближаемся к порогу блокировки, используем максимальную мощность
+        // чтобы гарантировать отправку команды блокировки
+        newPower = ESP_PWR_LVL_P9;
+    }
+    
+    // Применяем новую мощность, если она изменилась
+    if (newPower != lastPower) {
+        if (serialOutputEnabled) {
+            Serial.printf("Adjusting TX power: %d -> %d (RSSI: %d, State: %d, USB: %d)\n",
+                lastPower, newPower, rssi, state, isUSB);
+        }
+        NimBLEDevice::setPower(newPower);
+        lastPower = newPower;
+    }
+    
+    // Регулируем яркость дисплея
+    adjustBrightness(newPower);
 }
 
 // В начале файла после определений
